@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              Int           @id @default(autoincrement())
+  telegramId      BigInt        @unique @map("telegram_id")
+  username        String?
+  firstName       String        @map("first_name")
+  lastName        String?       @map("last_name")
+  balance         Int           @default(100)
+  totalWins       Int           @default(0) @map("total_wins")
+  totalGames      Int           @default(0) @map("total_games")
+  winStreak       Int           @default(0) @map("win_streak")
+  maxWinStreak    Int           @default(0) @map("max_win_streak")
+  isVip           Boolean       @default(false) @map("is_vip")
+  isBlocked       Boolean       @default(false) @map("is_blocked")
+  isAdmin         Boolean       @default(false) @map("is_admin")
+  lastLoginAt     DateTime      @default(now()) @map("last_login_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  gameResults     GameResult[]
+  transactions    Transaction[]
+  userTasks       UserTask[]
+  systemEvents    SystemEvent[]
+
+  @@map("users")
+}
+
+model GameResult {
+  id          Int      @id @default(autoincrement())
+  userId      Int      @map("user_id")
+  gameType    GameType @map("game_type")
+  bet         Int
+  result      String
+  payout      Int
+  won         Boolean
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@map("game_results")
+}
+
+model Transaction {
+  id              Int               @id @default(autoincrement())
+  userId          Int               @map("user_id")
+  type            TransactionType
+  amount          Int
+  description     String
+  paymentChargeId String?           @unique @map("payment_charge_id")
+  createdAt       DateTime          @default(now()) @map("created_at")
+
+  user            User              @relation(fields: [userId], references: [id])
+
+  @@map("transactions")
+}
+
+model Task {
+  id          Int        @id @default(autoincrement())
+  title       String
+  description String
+  type        TaskType
+  target      Int
+  reward      Int
+  isActive    Boolean    @default(true) @map("is_active")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  userTasks   UserTask[]
+
+  @@map("tasks")
+}
+
+model UserTask {
+  id          Int       @id @default(autoincrement())
+  userId      Int       @map("user_id")
+  taskId      Int       @map("task_id")
+  progress    Int       @default(0)
+  completed   Boolean   @default(false)
+  rewarded    Boolean   @default(false)
+  assignedAt  DateTime  @default(now()) @map("assigned_at")
+  completedAt DateTime? @map("completed_at")
+  expiresAt   DateTime  @map("expires_at")
+
+  user        User      @relation(fields: [userId], references: [id])
+  task        Task      @relation(fields: [taskId], references: [id])
+
+  @@unique([userId, taskId, assignedAt])
+  @@map("user_tasks")
+}
+
+model SystemEvent {
+  id          Int       @id @default(autoincrement())
+  userId      Int?      @map("user_id")
+  eventType   String    @map("event_type")
+  payload     Json?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  user        User?     @relation(fields: [userId], references: [id])
+
+  @@map("system_events")
+}
+
+model GameConfig {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("game_configs")
+}
+
+enum GameType {
+  COINFLIP
+  DICE
+  SLOTS
+}
+
+enum TransactionType {
+  GAME_WIN
+  GAME_LOSS
+  TASK_REWARD
+  PURCHASE
+  ADMIN_GRANT
+  ADMIN_DEDUCT
+}
+
+enum TaskType {
+  PLAY_GAMES
+  WIN_STREAK
+  TOP_RANK
+}
