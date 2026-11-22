@@ -48,11 +48,11 @@ const pendingActions = new Map<
 
 export function registerAdminCommand<C extends Context>(
   bot: Bot<C>,
-  adminIds: number[],
+  adminUsernames: string[],
 ): void {
   // /admin — entry point
   bot.command('admin', async (ctx) => {
-    if (!ctx.from || !adminIds.includes(ctx.from.id)) {
+    if (!ctx.from || !adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) {
       await ctx.reply('⛔ Нет доступа.');
       return;
     }
@@ -65,7 +65,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Stats ───────────────────────────────────────────────────
   bot.callbackQuery('admin:stats', async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
 
     const stats = await getSystemStats();
@@ -87,7 +87,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Events log ──────────────────────────────────────────────
   bot.callbackQuery('admin:events', async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
 
     const events = await getRecentEvents(15);
@@ -108,7 +108,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Back to main ─────────────────────────────────────────────
   bot.callbackQuery('admin:main', async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
     await ctx.editMessageText('🛠 <b>Панель администратора</b>\n\nВыберите действие:', {
       parse_mode: 'HTML',
@@ -118,7 +118,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Find user ────────────────────────────────────────────────
   bot.callbackQuery('admin:find_user', async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
     pendingActions.set(ctx.from.id, { action: 'find_user' });
     await ctx.reply('🔍 Введите Telegram ID, @username или внутренний ID пользователя:');
@@ -126,7 +126,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Game configs ─────────────────────────────────────────────
   bot.callbackQuery('admin:configs', async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
 
     const configs = await getAllGameConfigs();
@@ -144,7 +144,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Broadcast ────────────────────────────────────────────────
   bot.callbackQuery('admin:broadcast', async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
     pendingActions.set(ctx.from.id, { action: 'broadcast' });
     await ctx.reply(
@@ -155,7 +155,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Toggle block ─────────────────────────────────────────────
   bot.callbackQuery(/^admin:toggle_block:(\d+)$/, async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     const targetId = parseInt(ctx.match[1]);
     const target = await getUserById(targetId);
     if (!target) return ctx.answerCallbackQuery('Юзер не найден');
@@ -173,7 +173,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Toggle VIP ──────────────────────────────────────────────
   bot.callbackQuery(/^admin:toggle_vip:(\d+)$/, async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     const targetId = parseInt(ctx.match[1]);
     const target = await getUserById(targetId);
     if (!target) return ctx.answerCallbackQuery('Юзер не найден');
@@ -188,7 +188,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Grant/deduct points (step 1) ────────────────────────────
   bot.callbackQuery(/^admin:(grant|deduct):(\d+)$/, async (ctx) => {
-    if (!adminIds.includes(ctx.from.id)) return ctx.answerCallbackQuery('⛔');
+    if (!adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return ctx.answerCallbackQuery('⛔');
     await ctx.answerCallbackQuery();
     const action = ctx.match[1]; // 'grant' or 'deduct'
     const targetId = parseInt(ctx.match[2]);
@@ -198,7 +198,7 @@ export function registerAdminCommand<C extends Context>(
 
   // /setconfig command
   bot.command('setconfig', async (ctx) => {
-    if (!ctx.from || !adminIds.includes(ctx.from.id)) {
+    if (!ctx.from || !adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) {
       await ctx.reply('⛔ Нет доступа.');
       return;
     }
@@ -218,7 +218,7 @@ export function registerAdminCommand<C extends Context>(
 
   // ─── Text handler for pending admin actions ───────────────────
   bot.on('message:text', async (ctx, next) => {
-    if (!ctx.from || !adminIds.includes(ctx.from.id)) return next();
+    if (!ctx.from || !adminUsernames.includes((ctx.from.username ?? "").toLowerCase())) return next();
 
     const pending = pendingActions.get(ctx.from.id);
     if (!pending) return next();

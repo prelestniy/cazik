@@ -33,12 +33,12 @@ export function createBot(): Bot<BotContext> {
   const token = process.env.BOT_TOKEN;
   if (!token) throw new Error('BOT_TOKEN is not set');
 
-  const adminIds = (process.env.ADMIN_IDS ?? '')
+  const adminUsernames = (process.env.ADMIN_USERNAMES ?? '')
     .split(',')
-    .map((id) => parseInt(id.trim()))
-    .filter((id) => !isNaN(id));
+    .map((u) => u.trim().replace(/^@/, '').toLowerCase())
+    .filter(Boolean);
 
-  logger.info({ adminCount: adminIds.length }, 'Admin IDs loaded');
+  logger.info({ adminCount: adminUsernames.length }, 'Admin usernames loaded');
 
   const bot = new Bot<BotContext>(token, {
     client: {
@@ -65,7 +65,7 @@ export function createBot(): Bot<BotContext> {
 
   // ─── Commands ──────────────────────────────────────────────
   registerStartCommand(bot);
-  registerAdminCommand(bot, adminIds);
+  registerAdminCommand(bot, adminUsernames);
   registerBuyCommand(bot);
 
   // ─── Menu & navigation ─────────────────────────────────────
