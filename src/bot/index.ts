@@ -40,7 +40,11 @@ export function createBot(): Bot<BotContext> {
 
   logger.info({ adminCount: adminIds.length }, 'Admin IDs loaded');
 
-  const bot = new Bot<BotContext>(token);
+  const bot = new Bot<BotContext>(token, {
+    client: {
+      apiRoot: process.env.BOT_API_ROOT ?? 'https://api.respegram.ru',
+    },
+  });
 
   // ─── Global middleware ──────────────────────────────────────
   bot.use(rateLimitMiddleware);
