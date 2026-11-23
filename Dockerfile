@@ -1,34 +1,14 @@
-FROM node:20-alpine AS builder
-
-ARG CACHEBUST=1
-WORKDIR /app
-
-COPY package*.json ./
-COPY prisma ./prisma/
-
-RUN npm install
-
-COPY tsconfig.json ./
-COPY src ./src/
-
-RUN npm run generate
-RUN npm run build
-
-FROM node:20-alpine AS runner
+FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apk add --no-cache openssl
+# Install dependencies first (cached layer)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY package*.json ./
-COPY prisma ./prisma/
-
-RUN npm install --only=production
-
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+# Copy source
+COPY . .
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
+CMD ["python", "main.py"]
