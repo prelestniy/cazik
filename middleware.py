@@ -51,6 +51,8 @@ class DBMiddleware(BaseMiddleware):
                 except Exception as exc:
                     await session.rollback()
                     log.error("upsert_user failed: %s", exc)
+                    # Can't proceed without a user record — drop the update
+                    return
 
             data["session"] = session
             data["db_user"] = db_user

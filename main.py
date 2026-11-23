@@ -25,7 +25,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-async def on_startup(bot: Bot) -> None:
+async def on_startup(bot: Bot, **kwargs) -> None:
     log.info("Initialising database…")
     await init_db()
     async with SessionMaker() as session:
@@ -63,7 +63,7 @@ async def main() -> None:
     dp.update.outer_middleware(BlockMiddleware())
 
     dp.include_router(router)
-    dp.startup.register(lambda: on_startup(bot))
+    dp.startup.register(on_startup)
 
     # ── Health-check HTTP server ───────────────────────────────
     app = web.Application()
