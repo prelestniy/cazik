@@ -577,6 +577,11 @@ async def get_admin_users(session: AsyncSession) -> list[User]:
 #  - одна заявка на аккаунт: отклонённая тоже блокирует повторную подачу (user_id unique в БД);
 #  - при одобрении юзер пишет админу-контакту из NFT_CONTACT (по умолчанию @support).
 
+async def get_nft_claim(session: AsyncSession, uid: int) -> Optional[NftClaim]:
+    r = await session.execute(select(NftClaim).where(NftClaim.user_id == uid))
+    return r.scalars().first()
+
+
 async def create_nft_claim(session: AsyncSession, uid: int) -> NftClaim:
     """Бросает ValueError, если заявка уже подавалась."""
     # лочим строку юзера, чтобы два быстрых нажатия не создали две заявки
