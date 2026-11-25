@@ -102,13 +102,19 @@ async def get_rank(session: AsyncSession, user: User) -> int:
 
 async def block_user(session: AsyncSession, uid: int, blocked: bool) -> User:
     user = await get_user_by_id(session, uid)
+    if user is None:
+        raise ValueError(f"User #{uid} not found")
     user.is_blocked = blocked
+    await session.flush()
     return user
 
 
 async def toggle_vip(session: AsyncSession, uid: int, vip: bool) -> User:
     user = await get_user_by_id(session, uid)
+    if user is None:
+        raise ValueError(f"User #{uid} not found")
     user.is_vip = vip
+    await session.flush()
     return user
 
 
@@ -397,7 +403,8 @@ async def advance_task(session: AsyncSession, uid: int, task_type: str, inc: int
                UserTask.expires_at > now, Task.type == task_type)
     )
     for ut, t in r.all():
-        ut.progress = min(ut.progress + inc, t.target)
+        # clamp to [0, target]: a loss resets WIN_STREAK by passing a large negative inc
+        ut.progress = max(0, min(ut.progress + inc, t.target))
         if ut.progress >= t.target:
             ut.completed = True
             ut.completed_at = now

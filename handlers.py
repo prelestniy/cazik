@@ -425,9 +425,12 @@ async def cb_coinflip_play(cq: CallbackQuery, db_user: User, session: AsyncSessi
         f"{result_text}\n\n"
         f"💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
     )
+    # advance tasks — same session; a loss resets WIN_STREAK progress
     await advance_task(session, db_user.id, "PLAY_GAMES")
     if out.won:
         await advance_task(session, db_user.id, "WIN_STREAK")
+    else:
+        await advance_task(session, db_user.id, "WIN_STREAK", inc=-999)
     await session.commit()
 
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
@@ -512,6 +515,8 @@ async def cb_dice_play(cq: CallbackQuery, db_user: User, session: AsyncSession) 
     await advance_task(session, db_user.id, "PLAY_GAMES")
     if out.won:
         await advance_task(session, db_user.id, "WIN_STREAK")
+    else:
+        await advance_task(session, db_user.id, "WIN_STREAK", inc=-999)  # reset streak
     await session.commit()
 
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
@@ -577,11 +582,12 @@ async def msg_slots_bet(message: Message, db_user: User, state: FSMContext,
         f"{result_text}\n\n"
         f"💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
     )
-    async with SessionMaker() as s2:
-        await advance_task(s2, db_user.id, "PLAY_GAMES")
-        if out.won:
-            await advance_task(s2, db_user.id, "WIN_STREAK")
-        await s2.commit()
+    await advance_task(session, db_user.id, "PLAY_GAMES")
+    if out.won:
+        await advance_task(session, db_user.id, "WIN_STREAK")
+    else:
+        await advance_task(session, db_user.id, "WIN_STREAK", inc=-999)  # reset streak
+    await session.commit()
 
     await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
 
@@ -711,34 +717,50 @@ async def msg_admin_find(message: Message, state: FSMContext, session: AsyncSess
 async def cb_admin_block(cq: CallbackQuery, session: AsyncSession) -> None:
     if not _is_admin(cq.from_user.username):
         await cq.answer("⛔"); return
-    parts   = cq.data.split(":")
-    uid, v  = int(parts[2]), bool(int(parts[3]))
-    updated = await block_user(session, uid, v)
-    await log_event(session, "ADMIN_BLOCK_TOGGLE", cq.from_user.id, {"uid": uid, "blocked": v})
-    await session.commit()
-    await cq.answer("🚫 Заблокирован" if v else "✅ Разблокирован")
+    parts  = cq.data.split(":")
+    uid, v = int(parts[2]), bool(int(parts[3]))
     try:
-        await cq.message.edit_reply_markup(
-            reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
-    except TelegramBadRequest:
-        pass
+        updated = await block_user(session, uid, v)
+        await log_event(session, "ADMIN_BLOCK_TOGGLE", cq.from_user.id, {"uid": uid, "blocked": v})
+        await session.commit()
+        await cq.answer("🚫 Заблокирован" if v else "✅ Разблокирован", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(
+                reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
+        except TelegramBadRequest:
+            pass
+    except ValueError as e:
+        await session.rollback()
+        await cq.answer(f"❌ {e}", show_alert=True)
+    except Exception as e:
+        await session.rollback()
+        log.error("block_user failed uid=%s: %s", uid, e)
+        await cq.answer("❌ Ошибка при блокировке", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin:vip:"))
 async def cb_admin_vip(cq: CallbackQuery, session: AsyncSession) -> None:
     if not _is_admin(cq.from_user.username):
         await cq.answer("⛔"); return
-    parts   = cq.data.split(":")
-    uid, v  = int(parts[2]), bool(int(parts[3]))
-    updated = await toggle_vip(session, uid, v)
-    await log_event(session, "ADMIN_VIP_TOGGLE", cq.from_user.id, {"uid": uid, "vip": v})
-    await session.commit()
-    await cq.answer("⭐ VIP выдан" if v else "❌ VIP снят")
+    parts  = cq.data.split(":")
+    uid, v = int(parts[2]), bool(int(parts[3]))
     try:
-        await cq.message.edit_reply_markup(
-            reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
-    except TelegramBadRequest:
-        pass
+        updated = await toggle_vip(session, uid, v)
+        await log_event(session, "ADMIN_VIP_TOGGLE", cq.from_user.id, {"uid": uid, "vip": v})
+        await session.commit()
+        await cq.answer("⭐ VIP выдан" if v else "❌ VIP снят", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(
+                reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
+        except TelegramBadRequest:
+            pass
+    except ValueError as e:
+        await session.rollback()
+        await cq.answer(f"❌ {e}", show_alert=True)
+    except Exception as e:
+        await session.rollback()
+        log.error("toggle_vip failed uid=%s: %s", uid, e)
+        await cq.answer("❌ Ошибка при изменении VIP", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin:grant:"))
