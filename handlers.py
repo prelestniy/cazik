@@ -2,6 +2,7 @@
 # *handlers — where user intent meets database reality*
 
 from __future__ import annotations
+import html
 import json
 import logging
 from typing import Optional
@@ -18,7 +19,7 @@ from config import ADMIN_USERNAMES
 from models import User, SessionMaker
 from services import (
     # user
-    get_rank, get_leaderboard, get_transactions, find_user_admin,
+    get_rank, get_leaderboard, get_transactions, find_user_admin, get_user_by_id,
     block_user, toggle_vip, admin_grant, admin_deduct,
     # game
     play_coinflip, play_dice, play_slots, game_stats,
@@ -31,12 +32,15 @@ from services import (
     SHOP_ITEMS, get_shop_item, process_payment,
     # fmt
     fmt_bal, fmt_winrate, progress_bar, fmt_time_left, fmt_username,
+    # withdraw
+    withdraw_min, cooldown_left, fmt_duration, create_withdrawal,
+    decide_withdrawal, get_admin_users,
 )
 from keyboards import (
     main_menu, games_menu, back_main, coinflip_choice, dice_choice,
-    shop_keyboard, admin_menu, user_manage, back_admin,
+    shop_keyboard, admin_menu, user_manage, back_admin, withdraw_decision,
 )
-from states import CoinflipSt, DiceSt, SlotsSt, AdminSt
+from states import CoinflipSt, DiceSt, SlotsSt, AdminSt, WithdrawSt
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -863,6 +867,125 @@ async def msg_admin_broadcast(message: Message, bot: Bot, state: FSMContext,
 # ═══════════════════════════════════════════════════════
 #  FALLBACK
 # ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════
+#  WITHDRAW (вывод очков, одобряет админ)
+# ═══════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "menu:withdraw")
+async def cb_withdraw_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
+                            state: FSMContext) -> None:
+    await cq.answer()
+    await state.clear()
+    left = await cooldown_left(session, db_user.id)
+    if left:
+        text = (
+            "💸 <b>Вывод очков</b>\n\n"
+            f"⏳ Заявка уже подана сегодня. Следующая будет доступна через <b>{fmt_duration(left)}</b>"
+        )
+        await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
+        return
+    mn = withdraw_min(db_user)
+    text = (
+        "💸 <b>Вывод очков</b>\n\n"
+        f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>\n"
+        f"📌 Минимум: {fmt_bal(mn)} очков{' (VIP)' if db_user.is_vip else ''}\n"
+        "📅 Одна заявка в сутки, максимума нет\n\n"
+        "Введи сумму для вывода:"
+    )
+    await state.set_state(WithdrawSt.amount)
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
+
+
+@router.message(WithdrawSt.amount)
+async def msg_withdraw_amount(message: Message, bot: Bot, db_user: User, state: FSMContext,
+                              session: AsyncSession) -> None:
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("❌ Введи целое число очков:")
+        return
+    try:
+        w = await create_withdrawal(session, db_user.id, int(txt))
+    except ValueError as e:
+        # ничего не менялось до raise, откат не нужен (и опасен: сбрасывает db_user)
+        await message.answer(f"❌ {e}")
+        if "в сутки" in str(e):
+            await state.clear()
+        return
+
+    # уведомляем админов с кнопками; если никто не получил — заявку не создаём
+    text = (
+        f"💸 <b>Заявка на вывод #{w.id}</b>\n"
+        f"👤 {html.escape(fmt_username(db_user))} (tg: <code>{db_user.telegram_id}</code>)\n"
+        f"💰 Сумма: <b>{fmt_bal(w.amount)} очков</b>\n"
+        f"⭐ VIP: {'да' if db_user.is_vip else 'нет'}"
+    )
+    sent = 0
+    for adm in await get_admin_users(session):
+        try:
+            await bot.send_message(adm.telegram_id, text, parse_mode="HTML",
+                                   reply_markup=withdraw_decision(w.id))
+            sent += 1
+        except Exception as exc:
+            log.warning("withdraw notify failed admin=%s: %s", adm.telegram_id, exc)
+
+    if sent == 0:
+        await session.rollback()
+        await state.clear()
+        await message.answer("❌ Заявка не отправлена: админы недоступны. Очки не списаны, попробуй позже.")
+        return
+
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ Заявка #{w.id} на <b>{fmt_bal(w.amount)} очков</b> отправлена.\n"
+        "Ответ придёт сюда после проверки.",
+        parse_mode="HTML", reply_markup=back_main(),
+    )
+
+
+@router.callback_query(F.data.startswith("wd:"))
+async def cb_withdraw_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    if not _is_admin(cq.from_user.username):
+        await cq.answer("⛔"); return
+    _, action, wid_s = cq.data.split(":")
+    approve = action == "approve"
+    w = await decide_withdrawal(session, int(wid_s), approve)
+    if w is None:
+        await session.rollback()
+        await cq.answer("Заявка уже обработана", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        return
+
+    user = await get_user_by_id(session, w.user_id)
+    await log_event(session, "WITHDRAW_APPROVED" if approve else "WITHDRAW_REJECTED",
+                    cq.from_user.id, {"wid": w.id, "amount": w.amount})
+    await session.commit()
+
+    # убираем кнопки и дописываем решение в сообщение админа
+    verdict = "✅ Одобрено" if approve else "❌ Отклонено, очки возвращены"
+    base = html.escape(cq.message.text or "")
+    try:
+        await cq.message.edit_text(f"{base}\n\n{verdict} @{cq.from_user.username or cq.from_user.id}",
+                                   parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+
+    # ответ юзеру
+    try:
+        if approve:
+            msg = f"✅ Вывод <b>{fmt_bal(w.amount)} очков</b> (заявка #{w.id}) одобрен."
+        else:
+            msg = (f"❌ Заявка #{w.id} на вывод отклонена. "
+                   f"<b>{fmt_bal(w.amount)} очков</b> вернулись на баланс.")
+        await bot.send_message(user.telegram_id, msg, parse_mode="HTML")
+    except Exception as exc:
+        log.warning("withdraw notify user failed: %s", exc)
+    await cq.answer("Готово")
+
 
 @router.callback_query()
 async def cb_fallback(cq: CallbackQuery) -> None:

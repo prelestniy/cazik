@@ -11,7 +11,8 @@ from typing import Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_, case
 
-from models import User, GameResult, Transaction, Task, UserTask, GameConfig, SystemEvent
+from models import User, GameResult, Transaction, Task, UserTask, GameConfig, SystemEvent, Withdrawal
+from config import ADMIN_USERNAMES
 
 log = logging.getLogger(__name__)
 
@@ -467,3 +468,92 @@ async def process_payment(session: AsyncSession, user: User,
                   item["points"] or item["stars"],
                   f"Purchase: {item['title']}", charge_id=charge_id)
     return True
+
+
+# ═══════════════════════════════════════════════════════
+#  WITHDRAW
+# ═══════════════════════════════════════════════════════
+
+WITHDRAW_MIN      = 2000                     # обычный минимум, очки
+WITHDRAW_MIN_VIP  = 1200                     # минимум для VIP
+WITHDRAW_COOLDOWN = timedelta(hours=24)      # одна заявка в сутки
+# ДОПУЩЕНИЯ:
+#  - "в сутки" = скользящие 24 часа от последней поданной заявки (не календарные сутки).
+#    Считаются все заявки, включая отклонённые.
+#  - Очки списываются сразу при подаче, при отклонении возвращаются.
+#  - Максимума нет: можно вывести любую сумму от минимума до баланса.
+
+
+def withdraw_min(user: User) -> int:
+    return WITHDRAW_MIN_VIP if user.is_vip else WITHDRAW_MIN
+
+
+def fmt_duration(td: timedelta) -> str:
+    total = int(td.total_seconds())
+    h, rem = divmod(total, 3600)
+    m = rem // 60
+    return f"{h}ч {m}м" if h else f"{max(m, 1)}м"
+
+
+async def last_withdrawal(session: AsyncSession, uid: int) -> Optional[Withdrawal]:
+    r = await session.execute(
+        select(Withdrawal).where(Withdrawal.user_id == uid)
+        .order_by(Withdrawal.created_at.desc()).limit(1)
+    )
+    return r.scalars().first()
+
+
+async def cooldown_left(session: AsyncSession, uid: int) -> Optional[timedelta]:
+    """Сколько осталось до следующей заявки, или None если можно подавать."""
+    last = await last_withdrawal(session, uid)
+    if not last:
+        return None
+    left = last.created_at + WITHDRAW_COOLDOWN - datetime.utcnow()
+    return left if left.total_seconds() > 0 else None
+
+
+async def create_withdrawal(session: AsyncSession, uid: int, amount: int) -> Withdrawal:
+    """Бросает ValueError с текстом для юзера, если заявку подать нельзя."""
+    # блокируем строку юзера, чтобы два быстрых тапа не прошли проверку лимита оба
+    r = await session.execute(select(User).where(User.id == uid).with_for_update())
+    user = r.scalar_one()
+    if amount <= 0:
+        raise ValueError("Сумма должна быть больше 0")
+    if amount < withdraw_min(user):
+        raise ValueError(f"Минимум для вывода: {withdraw_min(user)} очков")
+    if amount > user.balance:
+        raise ValueError("Недостаточно очков")
+    left = await cooldown_left(session, uid)
+    if left:
+        raise ValueError(f"Одна заявка в сутки. Следующая будет через {fmt_duration(left)}")
+    user.balance -= amount
+    w = Withdrawal(user_id=uid, amount=amount, status="PENDING")
+    session.add(w)
+    await session.flush()
+    await _add_tx(session, uid, "WITHDRAW_REQUEST", amount, f"Withdraw request #{w.id}")
+    return w
+
+
+async def decide_withdrawal(session: AsyncSession, wid: int, approve: bool) -> Optional[Withdrawal]:
+    """None — заявка не найдена или уже обработана (двойной клик / другой админ)."""
+    r = await session.execute(select(Withdrawal).where(Withdrawal.id == wid).with_for_update())
+    w = r.scalar_one_or_none()
+    if not w or w.status != "PENDING":
+        return None
+    w.status = "APPROVED" if approve else "REJECTED"
+    w.decided_at = datetime.utcnow()
+    if not approve:
+        user = await get_user_by_id(session, w.user_id)
+        user.balance += w.amount
+        await _add_tx(session, w.user_id, "WITHDRAW_REFUND", w.amount, f"Refund withdraw #{w.id}")
+    return w
+
+
+async def get_admin_users(session: AsyncSession) -> list[User]:
+    # ДОПУЩЕНИЕ: админы определяются по ADMIN_USERNAMES и должны хотя бы раз открыть бота
+    if not ADMIN_USERNAMES:
+        return []
+    r = await session.execute(
+        select(User).where(func.lower(User.username).in_(ADMIN_USERNAMES))
+    )
+    return list(r.scalars())

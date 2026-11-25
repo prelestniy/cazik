@@ -12,8 +12,9 @@ def main_menu() -> InlineKeyboardMarkup:
     b.button(text="🏆 Рейтинг",   callback_data="menu:leaderboard")
     b.button(text="📋 Задания",    callback_data="menu:tasks")
     b.button(text="💎 Купить",     callback_data="menu:buy")
+    b.button(text="💸 Вывод",      callback_data="menu:withdraw")
     b.button(text="❓ Помощь",     callback_data="menu:help")
-    b.adjust(2, 2, 2, 1)
+    b.adjust(2, 2, 2, 2)
     return b.as_markup()
 
 
@@ -89,4 +90,13 @@ def user_manage(uid: int, blocked: bool, vip: bool) -> InlineKeyboardMarkup:
 def back_admin() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="« Назад", callback_data="admin:main")
+    return b.as_markup()
+
+
+def withdraw_decision(wid: int) -> InlineKeyboardMarkup:
+    """Кнопки под заявкой на вывод, которые видят админы."""
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Одобрить",  callback_data=f"wd:approve:{wid}")
+    b.button(text="❌ Отклонить", callback_data=f"wd:reject:{wid}")
+    b.adjust(2)
     return b.as_markup()

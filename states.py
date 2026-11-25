@@ -13,6 +13,10 @@ class SlotsSt(StatesGroup):
     bet = State()
 
 
+class WithdrawSt(StatesGroup):
+    amount = State()
+
+
 class AdminSt(StatesGroup):
     find_user    = State()
     broadcast    = State()
