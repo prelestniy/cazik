@@ -619,3 +619,25 @@ async def decide_nft_claim(session: AsyncSession, cid: int, action: str) -> Opti
     c.status = {"approve": "APPROVED", "reject": "REJECTED", "deny": "DENIED"}[action]
     c.decided_at = datetime.utcnow()
     return c
+
+
+# ═══════════════════════════════════════════════════════
+#  GAME SETTLE (новые игры: мины, рулетка, джокер, блэкджек, колесо)
+# ═══════════════════════════════════════════════════════
+
+def vip_mult(user: User) -> float:
+    return VIP_MULT if user.is_vip else 1.0
+
+
+def calc_payout(user: User, bet: int, base_mult: float) -> int:
+    """VIP +5% только к выигрышу. При ×1 (возврат) и проигрыше бонуса нет."""
+    if base_mult > 1.0:
+        return int(bet * base_mult * vip_mult(user))
+    return int(bet * base_mult)
+
+
+async def settle_game(session: AsyncSession, user: User, game_type: str, bet: int,
+                      result: str, base_mult: float) -> GameOut:
+    """Бросает ValueError, если баланса не хватает на ставку (ничего не меняется)."""
+    payout = calc_payout(user, bet, base_mult)
+    return await _commit_game(session, user, game_type, bet, result, payout, won=payout > bet)

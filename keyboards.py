@@ -21,11 +21,56 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def games_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="🪙 Монетка",    callback_data="game:coinflip")
-    b.button(text="🎲 Кубик",      callback_data="game:dice")
-    b.button(text="🎰 Слоты",      callback_data="game:slots")
-    b.button(text="« Назад",       callback_data="menu:main")
-    b.adjust(2, 1, 1)
+    b.button(text="🪙 Монетка",     callback_data="game:coinflip")
+    b.button(text="🎲 Кубик",       callback_data="game:dice")
+    b.button(text="🎰 Слоты",       callback_data="game:slots")
+    b.button(text="💣 Мины",        callback_data="game:mines")
+    b.button(text="🎡 Рулетка",     callback_data="game:roulette")
+    b.button(text="🃏 Джокер",      callback_data="game:joker")
+    b.button(text="🂡 Блэкджек",    callback_data="game:blackjack")
+    b.button(text="🎠 Колесо",      callback_data="game:wheel")
+    b.button(text="« Назад",        callback_data="menu:main")
+    b.adjust(2, 2, 2, 2, 1)
+    return b.as_markup()
+
+
+def mines_board(opened: list[int], reveal: list[int] | None, cash_label: str | None) -> InlineKeyboardMarkup:
+    """Поле 5×5. reveal не None — игра закончилась, мины показаны."""
+    b = InlineKeyboardBuilder()
+    ended = reveal is not None
+    for i in range(25):
+        if ended and i in reveal:
+            b.button(text="💣", callback_data="mines:noop")
+        elif i in opened:
+            b.button(text="💎", callback_data="mines:noop")
+        elif ended:
+            b.button(text="▫️", callback_data="mines:noop")
+        else:
+            b.button(text="▫️", callback_data=f"mines:open:{i}")
+    if cash_label:
+        b.button(text=cash_label, callback_data="mines:cash")
+    else:
+        b.button(text="« Игры", callback_data="menu:games")
+    b.adjust(5, 5, 5, 5, 5, 1)
+    return b.as_markup()
+
+
+def roulette_kinds() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔴 Красное ×2",  callback_data="roul:red")
+    b.button(text="⚫ Чёрное ×2",    callback_data="roul:black")
+    b.button(text="Чётное ×2",      callback_data="roul:even")
+    b.button(text="Нечётное ×2",    callback_data="roul:odd")
+    b.button(text="🎯 Число ×36",   callback_data="roul:num")
+    b.adjust(2, 2, 1)
+    return b.as_markup()
+
+
+def bj_actions() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Ещё карту", callback_data="bj:hit")
+    b.button(text="✋ Хватит",     callback_data="bj:stand")
+    b.adjust(2)
     return b.as_markup()
 
 

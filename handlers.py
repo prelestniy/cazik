@@ -42,7 +42,14 @@ from keyboards import (
     main_menu, games_menu, back_main, coinflip_choice, dice_choice,
     shop_keyboard, admin_menu, user_manage, back_admin, withdraw_decision, nft_decision,
 )
-from states import CoinflipSt, DiceSt, SlotsSt, AdminSt, WithdrawSt
+from states import CoinflipSt, DiceSt, SlotsSt, AdminSt, WithdrawSt, MinesSt, RouletteSt, JokerSt, BjSt, WheelSt
+from keyboards import mines_board, roulette_kinds, bj_actions
+from services import settle_game, calc_payout
+from casino_games import (
+    mines_place, mines_multiplier, MINES_SAFE, roulette_spin, roulette_win, RED_NUMBERS,
+    joker_draw, joker_multiplier, new_deck, hand_value, is_blackjack, blackjack_settle,
+    dealer_play, wheel_spin,
+)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -1101,6 +1108,331 @@ async def cb_nft_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> N
     except Exception as exc:
         log.warning("nft notify user failed: %s", exc)
     await cq.answer("Готово")
+
+
+# ═══════════════════════════════════════════════════════
+#  NEW GAMES: мины, рулетка, джокер, блэкджек, колесо
+#  Правила и множители — в casino_games.py. Ставка от NEW_MIN_BET, без максимума.
+# ═══════════════════════════════════════════════════════
+
+NEW_MIN_BET = 100
+
+RULES = {
+    "mines": "Поле 5×5, 3 мины. Открывай клетки: каждая безопасная поднимает множитель. "
+             "Забрать можно в любой момент. На мине ставка сгорает.",
+    "roulette": "Числа 0–36. Цвет или чётное/нечётное ×2, конкретное число ×36. "
+                "0 зелёный: на цвет и чётность ставка проигрывает.",
+    "joker": "Одна карта из 53 (с джокером). Джокер ×3, J/Q/K/A ×2, остальные проигрыш.",
+    "blackjack": "Дилер берёт до 17. Победа ×2, блэкджек ×2.5, ничья — возврат ставки. Перебор — проигрыш.",
+    "wheel": "8 секторов от ×0 до ×10. Сектор выпадает случайно, с весом.",
+}
+
+
+def _bet_prompt(title: str, key: str, db_user: User) -> str:
+    return (f"{title}\n\n{RULES[key]}\n\n"
+            f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>\n"
+            f"📌 Ставка: от {NEW_MIN_BET}, без максимума\n\n"
+            "Введи сумму ставки:")
+
+
+def _check_bet(text: Optional[str], balance: int) -> tuple[Optional[int], Optional[str]]:
+    t = (text or "").strip()
+    if not t.isdigit():
+        return None, f"❌ Введи целое число, от {NEW_MIN_BET}:"
+    bet = int(t)
+    if bet < NEW_MIN_BET:
+        return None, f"❌ Минимальная ставка {NEW_MIN_BET} очков:"
+    if bet > balance:
+        return None, f"❌ Недостаточно очков. Баланс: {fmt_bal(balance)}"
+    return bet, None
+
+
+async def _start_bet(cq: CallbackQuery, db_user: User, state: FSMContext,
+                     key: str, title: str, bet_state) -> None:
+    await cq.answer()
+    await state.clear()
+    await state.set_state(bet_state)
+    await _safe_edit(cq, _bet_prompt(title, key, db_user), parse_mode="HTML", reply_markup=back_main())
+
+
+async def _after_game(session: AsyncSession, uid: int, won: bool) -> None:
+    await advance_task(session, uid, "PLAY_GAMES")
+    if won:
+        await advance_task(session, uid, "WIN_STREAK")
+    else:
+        await advance_task(session, uid, "WIN_STREAK", inc=-999)  # проигрыш сбрасывает серию
+
+
+async def _settle_report(session: AsyncSession, db_user: User, bet: int, game_type: str,
+                         base_mult: float, result: str, title: str, detail: str) -> str:
+    """Расчёт ставки + текст результата. При ошибке баланса возвращает текст ошибки."""
+    try:
+        out = await settle_game(session, db_user, game_type, bet, result, base_mult)
+    except ValueError as e:
+        return f"❌ {e}"
+    await _after_game(session, db_user.id, out.won)
+    await session.commit()
+    if out.won:
+        head = f"🎉 <b>Выиграл!</b> +{fmt_bal(out.payout - bet)} очков"
+    elif out.payout == bet:
+        head = "🤝 <b>Ничья</b>, ставка возвращена"
+    else:
+        head = f"💀 <b>Проигрыш</b> −{fmt_bal(bet)} очков"
+    return f"{title}\n\n{detail}\n\n{head}\n💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
+
+
+# ─── МИНЫ ───────────────────────────────────────────────
+
+def _mines_text(bet: int, opened: list[int], db_user: User) -> str:
+    k = len(opened)
+    mult = mines_multiplier(k)
+    text = (f"💣 <b>Мины</b>\nСтавка: {fmt_bal(bet)}\n"
+            f"Открыто безопасных: {k}/{MINES_SAFE}\nМножитель: ×{mult:.2f}")
+    if k:
+        text += f"\nЗабрать: <b>{fmt_bal(calc_payout(db_user, bet, mult))}</b>"
+    return text
+
+
+@router.callback_query(F.data == "game:mines")
+async def cb_mines_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "mines", "💣 <b>Мины</b>", MinesSt.bet)
+
+
+@router.message(MinesSt.bet)
+async def msg_mines_bet(message: Message, db_user: User, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    await state.set_state(MinesSt.playing)
+    await state.update_data(bet=bet, mines=mines_place(), opened=[])
+    await message.answer(_mines_text(bet, [], db_user), parse_mode="HTML",
+                         reply_markup=mines_board([], None, None))
+
+
+@router.callback_query(F.data.startswith("mines:"))
+async def cb_mines_play(cq: CallbackQuery, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    if await state.get_state() != MinesSt.playing.state:
+        await cq.answer("Игра уже закончилась", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    if parts[1] == "noop":
+        await cq.answer()
+        return
+    data = await state.get_data()
+    bet, mines, opened = data["bet"], data["mines"], list(data["opened"])
+
+    if parts[1] == "cash":
+        if not opened:
+            await cq.answer("Сначала открой клетку", show_alert=True)
+            return
+        await cq.answer()
+        await _mines_end(cq, session, db_user, state, bet, opened, mines, win=True)
+        return
+
+    i = int(parts[2])
+    if i in opened:
+        await cq.answer()
+        return
+    await cq.answer()
+    if i in mines:
+        await _mines_end(cq, session, db_user, state, bet, opened, mines, win=False)
+        return
+
+    opened.append(i)
+    if len(opened) == MINES_SAFE:  # все безопасные открыты — авто-забор
+        await _mines_end(cq, session, db_user, state, bet, opened, mines, win=True)
+        return
+    await state.update_data(opened=opened)
+    pay = calc_payout(db_user, bet, mines_multiplier(len(opened)))
+    await _safe_edit(cq, _mines_text(bet, opened, db_user), parse_mode="HTML",
+                     reply_markup=mines_board(opened, None, f"💰 Забрать {fmt_bal(pay)}"))
+
+
+async def _mines_end(cq: CallbackQuery, session: AsyncSession, db_user: User, state: FSMContext,
+                     bet: int, opened: list[int], mines: list[int], win: bool) -> None:
+    k = len(opened)
+    base = mines_multiplier(k) if win else 0.0
+    result = f"cash:{k}" if win else f"boom:{k}"
+    try:
+        out = await settle_game(session, db_user, "MINES", bet, result, base)
+    except ValueError as e:
+        await state.clear()
+        await _safe_edit(cq, f"❌ {e}", reply_markup=back_main())
+        return
+    await _after_game(session, db_user.id, out.won)
+    await session.commit()
+    await state.clear()
+    if win:
+        head = f"💎 <b>Забрал!</b> ×{base:.2f}, +{fmt_bal(out.payout - bet)} очков"
+    else:
+        head = f"💥 <b>Мина!</b> Ставка {fmt_bal(bet)} сгорела"
+    text = f"💣 <b>Мины</b>\n\n{head}\n💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=mines_board(opened, mines, None))
+
+
+# ─── РУЛЕТКА ────────────────────────────────────────────
+
+async def _roulette_play(session: AsyncSession, db_user: User, bet: int, kind: str,
+                         pick: Optional[int]) -> str:
+    spin = roulette_spin()
+    _, mult = roulette_win(kind, pick, spin)
+    color = "🟢" if spin == 0 else ("🔴" if spin in RED_NUMBERS else "⚫")
+    return await _settle_report(session, db_user, bet, "ROULETTE", mult, f"{spin}:{kind}",
+                                "🎡 <b>Рулетка</b>", f"Выпало: {color} <b>{spin}</b>")
+
+
+@router.callback_query(F.data == "game:roulette")
+async def cb_roulette_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "roulette", "🎡 <b>Рулетка</b>", RouletteSt.bet)
+
+
+@router.message(RouletteSt.bet)
+async def msg_roulette_bet(message: Message, db_user: User, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    await state.update_data(bet=bet)
+    await state.set_state(RouletteSt.kind)
+    await message.answer(f"🎡 Ставка <b>{fmt_bal(bet)}</b>. Выбери ставку:", parse_mode="HTML",
+                         reply_markup=roulette_kinds())
+
+
+@router.callback_query(F.data.startswith("roul:"))
+async def cb_roulette_kind(cq: CallbackQuery, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    if await state.get_state() != RouletteSt.kind.state:
+        await cq.answer("Начни игру заново", show_alert=True)
+        return
+    kind = cq.data.split(":")[1]
+    await cq.answer()
+    if kind == "num":
+        await state.set_state(RouletteSt.number)
+        await cq.message.answer("🎯 Введи число от 0 до 36:")
+        return
+    bet = (await state.get_data())["bet"]
+    await state.clear()
+    text = await _roulette_play(session, db_user, bet, kind, None)
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
+
+
+@router.message(RouletteSt.number)
+async def msg_roulette_number(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    t = (message.text or "").strip()
+    if not t.isdigit() or not 0 <= int(t) <= 36:
+        await message.answer("❌ Введи число от 0 до 36:")
+        return
+    bet = (await state.get_data())["bet"]
+    await state.clear()
+    text = await _roulette_play(session, db_user, bet, "number", int(t))
+    await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+
+
+# ─── ДЖОКЕР ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "game:joker")
+async def cb_joker_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "joker", "🃏 <b>Джокер</b>", JokerSt.bet)
+
+
+@router.message(JokerSt.bet)
+async def msg_joker_bet(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    card = joker_draw()
+    mult = joker_multiplier(card)
+    await state.clear()
+    text = await _settle_report(session, db_user, bet, "JOKER", mult, card,
+                                "🃏 <b>Джокер</b>", f"Карта: <b>{card}</b> (×{mult:g})")
+    await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+
+
+# ─── БЛЭКДЖЕК ───────────────────────────────────────────
+
+def _bj_table(player: list[str], dealer: list[str], hidden: bool) -> str:
+    dealer_str = f"{dealer[0]} 🂠" if hidden else f"{' '.join(dealer)} = {hand_value(dealer)}"
+    return (f"🃏 <b>Блэкджек</b>\nДилер: {dealer_str}\n"
+            f"Ты: {' '.join(player)} = {hand_value(player)}")
+
+
+@router.callback_query(F.data == "game:blackjack")
+async def cb_bj_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "blackjack", "🃏 <b>Блэкджек</b>", BjSt.bet)
+
+
+@router.message(BjSt.bet)
+async def msg_bj_bet(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    deck = new_deck()
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+    if is_blackjack(player):  # натуральный блэкджек — сразу расчёт
+        outcome, mult = blackjack_settle(player, dealer)
+        await state.clear()
+        text = await _settle_report(session, db_user, bet, "BLACKJACK", mult, outcome,
+                                    "🃏 <b>Блэкджек</b>", _bj_table(player, dealer, hidden=False))
+        await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+        return
+    await state.set_state(BjSt.playing)
+    await state.update_data(bet=bet, deck=deck, player=player, dealer=dealer)
+    await message.answer(_bj_table(player, dealer, hidden=True) + f"\n\nСтавка: {fmt_bal(bet)}",
+                         parse_mode="HTML", reply_markup=bj_actions())
+
+
+@router.callback_query(F.data.in_({"bj:hit", "bj:stand"}))
+async def cb_bj_play(cq: CallbackQuery, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    if await state.get_state() != BjSt.playing.state:
+        await cq.answer("Игра уже закончилась", show_alert=True)
+        return
+    await cq.answer()
+    data = await state.get_data()
+    bet, deck, player, dealer = data["bet"], data["deck"], data["player"], data["dealer"]
+
+    if cq.data == "bj:hit":
+        player.append(deck.pop())
+        if hand_value(player) > 21:  # перебор
+            await state.clear()
+            text = await _settle_report(session, db_user, bet, "BLACKJACK", 0.0, "bust",
+                                        "🃏 <b>Блэкджек</b>", _bj_table(player, dealer, hidden=False))
+            await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
+            return
+        await state.update_data(deck=deck, player=player)
+        await _safe_edit(cq, _bj_table(player, dealer, hidden=True) + f"\n\nСтавка: {fmt_bal(bet)}",
+                         parse_mode="HTML", reply_markup=bj_actions())
+        return
+
+    # stand: дилер добирает до 17, потом расчёт
+    dealer_play(dealer, deck)
+    outcome, mult = blackjack_settle(player, dealer)
+    await state.clear()
+    text = await _settle_report(session, db_user, bet, "BLACKJACK", mult, outcome,
+                                "🃏 <b>Блэкджек</b>", _bj_table(player, dealer, hidden=False))
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
+
+
+# ─── КОЛЕСО ФОРТУНЫ ─────────────────────────────────────
+
+@router.callback_query(F.data == "game:wheel")
+async def cb_wheel_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "wheel", "🎠 <b>Колесо фортуны</b>", WheelSt.bet)
+
+
+@router.message(WheelSt.bet)
+async def msg_wheel_bet(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    mult = wheel_spin()
+    await state.clear()
+    text = await _settle_report(session, db_user, bet, "WHEEL", mult, f"x{mult:g}",
+                                "🎠 <b>Колесо фортуны</b>", f"Сектор: <b>×{mult:g}</b>")
+    await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
 
 
 @router.callback_query()
