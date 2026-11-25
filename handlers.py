@@ -76,7 +76,7 @@ async def cmd_start(message: Message, db_user: User) -> None:
             f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>"
         )
     else:
-        vip_line = "\n⭐ VIP-статус активен (+10% к выигрышам)" if db_user.is_vip else ""
+        vip_line = "\n⭐ VIP-статус активен (+5% к выигрышам)" if db_user.is_vip else ""
         text = (
             f"👋 С возвращением, <b>{db_user.first_name}</b>!\n\n"
             f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>{vip_line}"
@@ -113,12 +113,12 @@ async def cb_help(cq: CallbackQuery) -> None:
     await cq.answer()
     text = (
         "❓ <b>Помощь</b>\n\n"
-        "🪙 <b>Монетка</b> — угадай орёл/решка. Победа ×2 (VIP ×2.2)\n"
-        "🎲 <b>Кубик</b> — угадай точное число: ×5 (VIP ×5.5)\n"
-        "   Соседнее число: ×1 (VIP ×1.1)\n"
-        "🎰 <b>Слоты</b> — три одинаковых: ×10 (VIP ×11)\n"
-        "   Два одинаковых: ×2 (VIP ×2.2)\n\n"
-        "⭐ VIP-статус даёт +10% к каждому выигрышу\n"
+        "🪙 <b>Монетка</b> — угадай орёл/решка. Победа ×2 (VIP ×2.1)\n"
+        "🎲 <b>Кубик</b> — угадай точное число: ×5 (VIP ×5.25)\n"
+        "   Соседнее число: ×1 (VIP ×1.05)\n"
+        "🎰 <b>Слоты</b> — три одинаковых: ×10 (VIP ×10.5)\n"
+        "   Два одинаковых: ×2 (VIP ×2.1)\n\n"
+        "⭐ VIP-статус даёт +5% к каждому выигрышу\n"
         "📋 Задания обновляются каждый день в 00:00 UTC"
     )
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
@@ -309,7 +309,7 @@ async def cb_buy_item(cq: CallbackQuery, bot: Bot) -> None:
     item = get_shop_item(item_id)
     if not item:
         return
-    desc = "VIP-статус: +10% к каждому выигрышу" if item["is_vip"] else f"{item['points']} виртуальных очков"
+    desc = "VIP-статус: +5% к каждому выигрышу" if item["is_vip"] else f"{item['points']} виртуальных очков"
     await bot.send_invoice(
         chat_id=cq.from_user.id,
         title=item["title"],
@@ -343,7 +343,7 @@ async def on_payment(message: Message, db_user: User, session: AsyncSession) -> 
         await message.answer("✅ Платёж уже обработан ранее.")
         return
     if item["is_vip"]:
-        text = "⭐ <b>VIP-статус активирован!</b>\n\nТеперь вы получаете +10% к каждому выигрышу."
+        text = "⭐ <b>VIP-статус активирован!</b>\n\nТеперь вы получаете +5% к каждому выигрышу."
     else:
         text = (
             f"✅ <b>Успешная покупка!</b>\n\n"
@@ -360,13 +360,13 @@ async def on_payment(message: Message, db_user: User, session: AsyncSession) -> 
 async def cb_coinflip_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
                              state: FSMContext) -> None:
     await cq.answer()
-    mn = int(await get_config(session, "coinflip.min_bet", "10"))
-    mx = int(await get_config(session, "coinflip.max_bet", "500"))
+    mn = 1  # без минимума: только больше 0
+    mx = None  # без максимума
     text = (
         f"🪙 <b>Монетка</b>\n\n"
         f"💰 Баланс: {fmt_bal(db_user.balance)} очков\n"
-        f"📌 Ставка: {mn} – {mx} очков\n"
-        f"🏆 Победа: ×{'2.2' if db_user.is_vip else '2'}\n\n"
+        f"📌 Ставка: от {mn} очков, без максимума\n"
+        f"🏆 Победа: ×{'2.1' if db_user.is_vip else '2'}\n\n"
         f"Введи сумму ставки:"
     )
     await state.set_state(CoinflipSt.bet)
@@ -380,11 +380,11 @@ async def msg_coinflip_bet(message: Message, db_user: User, state: FSMContext,
     data = await state.get_data()
     mn, mx = data["min_bet"], data["max_bet"]
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Введи число от {mn} до {mx}:")
+        await message.answer(f"❌ Введи целое число больше 0:")
         return
     bet = int(message.text.strip())
-    if bet < mn or bet > mx:
-        await message.answer(f"❌ Ставка должна быть от {mn} до {mx} очков:")
+    if bet < mn:
+        await message.answer(f"❌ Ставка должна быть не меньше {mn} очков:")
         return
     if db_user.balance < bet:
         await message.answer(f"❌ Недостаточно очков. Баланс: {fmt_bal(db_user.balance)}")
@@ -448,14 +448,14 @@ async def cb_coinflip_play(cq: CallbackQuery, db_user: User, session: AsyncSessi
 async def cb_dice_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
                          state: FSMContext) -> None:
     await cq.answer()
-    mn = int(await get_config(session, "dice.min_bet", "10"))
-    mx = int(await get_config(session, "dice.max_bet", "300"))
+    mn = 1  # без минимума: только больше 0
+    mx = None  # без максимума
     text = (
         f"🎲 <b>Кубик</b>\n\n"
         f"💰 Баланс: {fmt_bal(db_user.balance)} очков\n"
-        f"📌 Ставка: {mn} – {mx} очков\n"
-        f"🏆 Точное попадание: ×{'5.5' if db_user.is_vip else '5'}\n"
-        f"🎯 Соседнее число (±1): ×{'1.1' if db_user.is_vip else '1'}\n\n"
+        f"📌 Ставка: от {mn} очков, без максимума\n"
+        f"🏆 Точное попадание: ×{'5.25' if db_user.is_vip else '5'}\n"
+        f"🎯 Соседнее число (±1): ×{'1.05' if db_user.is_vip else '1'}\n\n"
         f"Введи сумму ставки:"
     )
     await state.set_state(DiceSt.bet)
@@ -469,11 +469,11 @@ async def msg_dice_bet(message: Message, db_user: User, state: FSMContext,
     data = await state.get_data()
     mn, mx = data["min_bet"], data["max_bet"]
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Введи число от {mn} до {mx}:")
+        await message.answer(f"❌ Введи целое число больше 0:")
         return
     bet = int(message.text.strip())
-    if bet < mn or bet > mx:
-        await message.answer(f"❌ Ставка должна быть от {mn} до {mx} очков:")
+    if bet < mn:
+        await message.answer(f"❌ Ставка должна быть не меньше {mn} очков:")
         return
     if db_user.balance < bet:
         await message.answer(f"❌ Недостаточно очков. Баланс: {fmt_bal(db_user.balance)}")
@@ -534,14 +534,14 @@ async def cb_dice_play(cq: CallbackQuery, db_user: User, session: AsyncSession) 
 async def cb_slots_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
                           state: FSMContext) -> None:
     await cq.answer()
-    mn = int(await get_config(session, "slots.min_bet", "20"))
-    mx = int(await get_config(session, "slots.max_bet", "200"))
+    mn = 1  # без минимума: только больше 0
+    mx = None  # без максимума
     text = (
         f"🎰 <b>Слоты</b>\n\n"
         f"💰 Баланс: {fmt_bal(db_user.balance)} очков\n"
-        f"📌 Ставка: {mn} – {mx} очков\n"
-        f"🏆 Три одинаковых: ×{'11' if db_user.is_vip else '10'}\n"
-        f"🎯 Два одинаковых: ×{'2.2' if db_user.is_vip else '2'}\n\n"
+        f"📌 Ставка: от {mn} очков, без максимума\n"
+        f"🏆 Три одинаковых: ×{'10.5' if db_user.is_vip else '10'}\n"
+        f"🎯 Два одинаковых: ×{'2.1' if db_user.is_vip else '2'}\n\n"
         f"Введи сумму ставки:"
     )
     await state.set_state(SlotsSt.bet)
@@ -555,11 +555,11 @@ async def msg_slots_bet(message: Message, db_user: User, state: FSMContext,
     data = await state.get_data()
     mn, mx = data["min_bet"], data["max_bet"]
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Введи число от {mn} до {mx}:")
+        await message.answer(f"❌ Введи целое число больше 0:")
         return
     bet = int(message.text.strip())
-    if bet < mn or bet > mx:
-        await message.answer(f"❌ Ставка должна быть от {mn} до {mx} очков:")
+    if bet < mn:
+        await message.answer(f"❌ Ставка должна быть не меньше {mn} очков:")
         return
     if db_user.balance < bet:
         await message.answer(f"❌ Недостаточно очков. Баланс: {fmt_bal(db_user.balance)}")

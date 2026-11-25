@@ -179,6 +179,14 @@ async def find_user_admin(session: AsyncSession, query: str) -> Optional[User]:
 #  GAME SERVICE
 # ═══════════════════════════════════════════════════════
 
+# VIP даёт +5% к каждому выигрышу (множитель к базовому коэффициенту)
+VIP_MULT = 1.05
+
+
+def _vip(user: User) -> float:
+    return VIP_MULT if user.is_vip else 1.0
+
+
 SLOT_SYMS = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎"]
 
 
@@ -216,7 +224,7 @@ async def play_coinflip(session: AsyncSession, user: User,
                         bet: int, choice: str) -> GameOut:
     roll = "heads" if random.random() < 0.5 else "tails"
     won = roll == choice
-    mult = (2.2 if user.is_vip else 2.0) if won else 0.0
+    mult = (2.0 * _vip(user)) if won else 0.0
     payout = int(bet * mult)
     return await _commit_game(session, user, "COINFLIP", bet, roll, payout, won)
 
@@ -227,9 +235,9 @@ async def play_dice(session: AsyncSession, user: User,
     exact = roll == guess
     adjacent = not exact and abs(roll - guess) == 1
     if exact:
-        mult = 5.5 if user.is_vip else 5.0
+        mult = 5.0 * _vip(user)
     elif adjacent:
-        mult = 1.1 if user.is_vip else 1.0
+        mult = 1.0 * _vip(user)
     else:
         mult = 0.0
     won = exact or adjacent
@@ -243,9 +251,9 @@ async def play_slots(session: AsyncSession, user: User, bet: int) -> GameOut:
     all3 = reels[0] == reels[1] == reels[2]
     two  = not all3 and (reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2])
     if all3:
-        mult = 11.0 if user.is_vip else 10.0
+        mult = 10.0 * _vip(user)
     elif two:
-        mult = 2.2 if user.is_vip else 2.0
+        mult = 2.0 * _vip(user)
     else:
         mult = 0.0
     won = all3 or two
@@ -441,9 +449,11 @@ async def claim_reward(session: AsyncSession, uid: int, ut_id: int) -> Optional[
 # ═══════════════════════════════════════════════════════
 
 SHOP_ITEMS = [
-    {"id": "pack_500",    "title": "💰 Пакет 500 очков",   "points": 500,  "stars": 50,  "is_vip": False},
-    {"id": "pack_1500",   "title": "💎 Пакет 1500 очков",  "points": 1500, "stars": 130, "is_vip": False},
-    {"id": "pack_5000",   "title": "👑 Пакет 5000 очков",  "points": 5000, "stars": 400, "is_vip": False},
+    {"id": "pack_100",   "title": "🪙 Пакет 100 очков",   "points": 100,  "stars": 100,  "is_vip": False},
+    {"id": "pack_500",    "title": "💰 Пакет 500 очков",   "points": 500,  "stars": 500,  "is_vip": False},
+    {"id": "pack_1000",   "title": "💎 Пакет 1000 очков",  "points": 1000, "stars": 1000, "is_vip": False},
+    {"id": "pack_1500",   "title": "🏦 Пакет 1500 очков",  "points": 1500, "stars": 1500, "is_vip": False},
+    {"id": "pack_2000",   "title": "👑 Пакет 2000 очков",  "points": 2000, "stars": 2000, "is_vip": False},
     {"id": "vip_status",  "title": "⭐ VIP-статус",         "points": 0,    "stars": 150, "is_vip": True},
 ]
 
