@@ -36,7 +36,7 @@ from services import (
     withdraw_min, cooldown_left, fmt_duration, create_withdrawal,
     decide_withdrawal, get_admin_users,
     # free nft
-    create_nft_claim, decide_nft_claim,
+    create_nft_claim, decide_nft_claim, get_nft_claim,
 )
 from keyboards import (
     main_menu, games_menu, back_main, coinflip_choice, dice_choice,
@@ -1012,6 +1012,20 @@ def _nft_contact() -> str:
 
 @router.callback_query(F.data == "menu:nft")
 async def cb_nft_start(cq: CallbackQuery, bot: Bot, db_user: User, session: AsyncSession) -> None:
+    # уже есть заявка: показываем её статус, админам повторно не пишем (без спама)
+    existing = await get_nft_claim(session, db_user.id)
+    if existing:
+        if existing.status == "PENDING":
+            text = "🎁 <b>Бесплатный NFT</b>\n\n⏳ Заявка на рассмотрении. Ответ придёт сюда после проверки."
+        elif existing.status == "APPROVED":
+            text = (f"🎁 <b>Бесплатный NFT</b>\n\n✅ Заявка одобрена. "
+                    f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}")
+        else:
+            text = "🎁 <b>Бесплатный NFT</b>\n\n❌ Заявка отклонена. Получить бесплатный NFT можно только один раз."
+        await cq.answer()
+        await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
+        return
+
     try:
         claim = await create_nft_claim(session, db_user.id)
     except ValueError as e:
