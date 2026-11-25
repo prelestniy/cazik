@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import ADMIN_USERNAMES
+from config import ADMIN_USERNAMES, NFT_CONTACT
 from models import User, SessionMaker
 from services import (
     # user
@@ -35,10 +35,12 @@ from services import (
     # withdraw
     withdraw_min, cooldown_left, fmt_duration, create_withdrawal,
     decide_withdrawal, get_admin_users,
+    # free nft
+    create_nft_claim, decide_nft_claim,
 )
 from keyboards import (
     main_menu, games_menu, back_main, coinflip_choice, dice_choice,
-    shop_keyboard, admin_menu, user_manage, back_admin, withdraw_decision,
+    shop_keyboard, admin_menu, user_manage, back_admin, withdraw_decision, nft_decision,
 )
 from states import CoinflipSt, DiceSt, SlotsSt, AdminSt, WithdrawSt
 
@@ -984,6 +986,93 @@ async def cb_withdraw_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession)
         await bot.send_message(user.telegram_id, msg, parse_mode="HTML")
     except Exception as exc:
         log.warning("withdraw notify user failed: %s", exc)
+    await cq.answer("Готово")
+
+
+# ═══════════════════════════════════════════════════════
+#  FREE NFT (одна заявка на аккаунт, одобряет админ)
+# ═══════════════════════════════════════════════════════
+
+async def _notify_admins(bot: Bot, session: AsyncSession, text: str, markup) -> int:
+    """Отправляет сообщение всем админам, возвращает сколько доставлено."""
+    sent = 0
+    for adm in await get_admin_users(session):
+        try:
+            await bot.send_message(adm.telegram_id, text, parse_mode="HTML", reply_markup=markup)
+            sent += 1
+        except Exception as exc:
+            log.warning("notify admin failed admin=%s: %s", adm.telegram_id, exc)
+    return sent
+
+
+def _nft_contact() -> str:
+    c = NFT_CONTACT.strip()
+    return c if c.startswith("@") else f"@{c}"
+
+
+@router.callback_query(F.data == "menu:nft")
+async def cb_nft_start(cq: CallbackQuery, bot: Bot, db_user: User, session: AsyncSession) -> None:
+    try:
+        claim = await create_nft_claim(session, db_user.id)
+    except ValueError as e:
+        await cq.answer(str(e), show_alert=True)
+        return
+
+    admin_text = (
+        f"🎁 <b>Заявка на бесплатный NFT #{claim.id}</b>\n"
+        f"👤 {html.escape(fmt_username(db_user))} (tg: <code>{db_user.telegram_id}</code>)"
+    )
+    if await _notify_admins(bot, session, admin_text, nft_decision(claim.id)) == 0:
+        await session.rollback()  # заявку не создаём, чтобы юзер мог попробовать позже
+        await cq.answer("❌ Заявка не отправлена: админы недоступны. Попробуй позже.", show_alert=True)
+        return
+
+    await session.commit()
+    await cq.answer()
+    await _safe_edit(
+        cq,
+        "🎁 <b>Бесплатный NFT</b>\n\n✅ Заявка отправлена. Ответ придёт сюда после проверки.",
+        parse_mode="HTML", reply_markup=back_main(),
+    )
+
+
+@router.callback_query(F.data.startswith("nft:"))
+async def cb_nft_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    if not _is_admin(cq.from_user.username):
+        await cq.answer("⛔"); return
+    _, action, cid_s = cq.data.split(":")
+    approve = action == "approve"
+    claim = await decide_nft_claim(session, int(cid_s), approve)
+    if claim is None:
+        await session.rollback()
+        await cq.answer("Заявка уже обработана", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        return
+
+    user = await get_user_by_id(session, claim.user_id)
+    await log_event(session, "NFT_APPROVED" if approve else "NFT_REJECTED",
+                    cq.from_user.id, {"cid": claim.id})
+    await session.commit()
+
+    verdict = "✅ Одобрено" if approve else "❌ Отклонено"
+    base = html.escape(cq.message.text or "")
+    try:
+        await cq.message.edit_text(f"{base}\n\n{verdict} @{cq.from_user.username or cq.from_user.id}",
+                                   parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+
+    try:
+        if approve:
+            msg = f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}"
+        else:
+            msg = "❌ Заявка на бесплатный NFT отклонена."
+        await bot.send_message(user.telegram_id, msg)
+    except Exception as exc:
+        log.warning("nft notify user failed: %s", exc)
     await cq.answer("Готово")
 
 

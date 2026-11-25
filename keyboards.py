@@ -14,7 +14,8 @@ def main_menu() -> InlineKeyboardMarkup:
     b.button(text="💎 Купить",     callback_data="menu:buy")
     b.button(text="💸 Вывод",      callback_data="menu:withdraw")
     b.button(text="❓ Помощь",     callback_data="menu:help")
-    b.adjust(2, 2, 2, 2)
+    b.button(text="🎁 Бесплатный NFT", callback_data="menu:nft")
+    b.adjust(2, 2, 2, 2, 1)
     return b.as_markup()
 
 
@@ -90,6 +91,15 @@ def user_manage(uid: int, blocked: bool, vip: bool) -> InlineKeyboardMarkup:
 def back_admin() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="« Назад", callback_data="admin:main")
+    return b.as_markup()
+
+
+def nft_decision(cid: int) -> InlineKeyboardMarkup:
+    """Кнопки админа под заявкой на бесплатный NFT."""
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Одобрить",  callback_data=f"nft:approve:{cid}")
+    b.button(text="❌ Отклонить", callback_data=f"nft:reject:{cid}")
+    b.adjust(2)
     return b.as_markup()
 
 

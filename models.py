@@ -109,6 +109,16 @@ class Withdrawal(Base):
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class NftClaim(Base):
+    """Заявка на бесплатный NFT. Одна на аккаунт: user_id уникален, отклонённые тоже считаются."""
+    __tablename__ = "nft_claims"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING / APPROVED / REJECTED
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

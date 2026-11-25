@@ -11,7 +11,7 @@ from typing import Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_, case
 
-from models import User, GameResult, Transaction, Task, UserTask, GameConfig, SystemEvent, Withdrawal
+from models import User, GameResult, Transaction, Task, UserTask, GameConfig, SystemEvent, Withdrawal, NftClaim
 from config import ADMIN_USERNAMES
 
 log = logging.getLogger(__name__)
@@ -567,3 +567,35 @@ async def get_admin_users(session: AsyncSession) -> list[User]:
         select(User).where(func.lower(User.username).in_(ADMIN_USERNAMES))
     )
     return list(r.scalars())
+
+
+# ═══════════════════════════════════════════════════════
+#  FREE NFT
+# ═══════════════════════════════════════════════════════
+# ДОПУЩЕНИЯ:
+#  - заявка создаётся сразу при нажатии кнопки, без дополнительного подтверждения;
+#  - одна заявка на аккаунт: отклонённая тоже блокирует повторную подачу (user_id unique в БД);
+#  - при одобрении юзер пишет админу-контакту из NFT_CONTACT (по умолчанию @support).
+
+async def create_nft_claim(session: AsyncSession, uid: int) -> NftClaim:
+    """Бросает ValueError, если заявка уже подавалась."""
+    # лочим строку юзера, чтобы два быстрых нажатия не создали две заявки
+    await session.execute(select(User).where(User.id == uid).with_for_update())
+    r = await session.execute(select(NftClaim).where(NftClaim.user_id == uid))
+    if r.scalars().first():
+        raise ValueError("Бесплатный NFT можно получить только один раз. Заявка уже подавалась.")
+    c = NftClaim(user_id=uid, status="PENDING")
+    session.add(c)
+    await session.flush()
+    return c
+
+
+async def decide_nft_claim(session: AsyncSession, cid: int, approve: bool) -> Optional[NftClaim]:
+    """None — заявка не найдена или уже обработана."""
+    r = await session.execute(select(NftClaim).where(NftClaim.id == cid).with_for_update())
+    c = r.scalar_one_or_none()
+    if not c or c.status != "PENDING":
+        return None
+    c.status = "APPROVED" if approve else "REJECTED"
+    c.decided_at = datetime.utcnow()
+    return c
