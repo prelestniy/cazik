@@ -425,12 +425,10 @@ async def cb_coinflip_play(cq: CallbackQuery, db_user: User, session: AsyncSessi
         f"{result_text}\n\n"
         f"💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
     )
-    # advance tasks
-    async with SessionMaker() as s2:
-        await advance_task(s2, db_user.id, "PLAY_GAMES")
-        if out.won:
-            await advance_task(s2, db_user.id, "WIN_STREAK")
-        await s2.commit()
+    await advance_task(session, db_user.id, "PLAY_GAMES")
+    if out.won:
+        await advance_task(session, db_user.id, "WIN_STREAK")
+    await session.commit()
 
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
 
@@ -511,11 +509,10 @@ async def cb_dice_play(cq: CallbackQuery, db_user: User, session: AsyncSession) 
         f"{result_text}\n\n"
         f"💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
     )
-    async with SessionMaker() as s2:
-        await advance_task(s2, db_user.id, "PLAY_GAMES")
-        if out.won:
-            await advance_task(s2, db_user.id, "WIN_STREAK")
-        await s2.commit()
+    await advance_task(session, db_user.id, "PLAY_GAMES")
+    if out.won:
+        await advance_task(session, db_user.id, "WIN_STREAK")
+    await session.commit()
 
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
 

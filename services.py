@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════
 
 def fmt_bal(n: int) -> str:
-    return f"{n:,}".replace(",", " ")
+    return f"⭐ {n:,}".replace(",", " ")
 
 def fmt_winrate(wins: int, total: int) -> str:
     if not total:
@@ -55,9 +55,11 @@ async def upsert_user(session: AsyncSession, tg_id: int, username: Optional[str]
     r = await session.execute(select(User).where(User.telegram_id == tg_id))
     user = r.scalar_one_or_none()
     if user:
-        user.username = username
-        user.first_name = first_name
-        user.last_name = last_name
+        # Only mark dirty if something actually changed (avoids pointless UPDATE on every request)
+        if user.username != username or user.first_name != first_name or user.last_name != last_name:
+            user.username = username
+            user.first_name = first_name
+            user.last_name = last_name
         user.last_login_at = datetime.utcnow()
     else:
         user = User(telegram_id=tg_id, username=username,
