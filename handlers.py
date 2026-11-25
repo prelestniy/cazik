@@ -36,7 +36,7 @@ from services import (
     withdraw_min, cooldown_left, fmt_duration, create_withdrawal,
     decide_withdrawal, get_admin_users,
     # free nft
-    create_nft_claim, decide_nft_claim, get_nft_claim,
+    create_nft_claim, decide_nft_claim, get_nft_claims, nft_state,
 )
 from keyboards import (
     main_menu, games_menu, back_main, coinflip_choice, dice_choice,
@@ -990,7 +990,7 @@ async def cb_withdraw_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession)
 
 
 # ═══════════════════════════════════════════════════════
-#  FREE NFT (одна заявка на аккаунт, одобряет админ)
+#  FREE NFT (админ одобряет; после отказа можно подать снова)
 # ═══════════════════════════════════════════════════════
 
 async def _notify_admins(bot: Bot, session: AsyncSession, text: str, markup) -> int:
@@ -1012,20 +1012,29 @@ def _nft_contact() -> str:
 
 @router.callback_query(F.data == "menu:nft")
 async def cb_nft_start(cq: CallbackQuery, bot: Bot, db_user: User, session: AsyncSession) -> None:
-    # уже есть заявка: показываем её статус, админам повторно не пишем (без спама)
-    existing = await get_nft_claim(session, db_user.id)
-    if existing:
-        if existing.status == "PENDING":
-            text = "🎁 <b>Бесплатный NFT</b>\n\n⏳ Заявка на рассмотрении. Ответ придёт сюда после проверки."
-        elif existing.status == "APPROVED":
-            text = (f"🎁 <b>Бесплатный NFT</b>\n\n✅ Заявка одобрена. "
-                    f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}")
-        else:
-            text = "🎁 <b>Бесплатный NFT</b>\n\n❌ Заявка отклонена. Получить бесплатный NFT можно только один раз."
+    claims = await get_nft_claims(session, db_user.id)
+    state = nft_state(claims)
+
+    # ответы без новых сообщений админам
+    if state == "APPROVED":
+        text = ("🎁 <b>Бесплатный NFT</b>\n\n✅ Заявка одобрена. "
+                f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}")
         await cq.answer()
         await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
         return
+    if state == "DENIED":
+        await cq.answer()
+        await _safe_edit(cq, "🎁 <b>Бесплатный NFT</b>\n\n🚫 NFT увы, но вы не получите.",
+                         parse_mode="HTML", reply_markup=back_main())
+        return
+    if state == "PENDING":
+        await cq.answer()
+        await _safe_edit(cq, "🎁 <b>Бесплатный NFT</b>\n\n⏳ Заявка на рассмотрении. Ответ придёт сюда после проверки.",
+                         parse_mode="HTML", reply_markup=back_main())
+        return
 
+    # новая заявка или подача после отказа
+    resubmit = bool(claims)
     try:
         claim = await create_nft_claim(session, db_user.id)
     except ValueError as e:
@@ -1033,10 +1042,11 @@ async def cb_nft_start(cq: CallbackQuery, bot: Bot, db_user: User, session: Asyn
         return
 
     admin_text = (
-        f"🎁 <b>Заявка на бесплатный NFT #{claim.id}</b>\n"
+        f"🎁 <b>Заявка на бесплатный NFT #{claim.id}</b>"
+        f"{' (повторная)' if resubmit else ''}\n"
         f"👤 {html.escape(fmt_username(db_user))} (tg: <code>{db_user.telegram_id}</code>)"
     )
-    if await _notify_admins(bot, session, admin_text, nft_decision(claim.id)) == 0:
+    if await _notify_admins(bot, session, admin_text, nft_decision(claim.id, allow_deny=resubmit)) == 0:
         await session.rollback()  # заявку не создаём, чтобы юзер мог попробовать позже
         await cq.answer("❌ Заявка не отправлена: админы недоступны. Попробуй позже.", show_alert=True)
         return
@@ -1055,8 +1065,10 @@ async def cb_nft_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> N
     if not _is_admin(cq.from_user.username):
         await cq.answer("⛔"); return
     _, action, cid_s = cq.data.split(":")
-    approve = action == "approve"
-    claim = await decide_nft_claim(session, int(cid_s), approve)
+    if action not in ("approve", "reject", "deny"):
+        await cq.answer("❓ Неизвестное действие"); return
+
+    claim = await decide_nft_claim(session, int(cid_s), action)
     if claim is None:
         await session.rollback()
         await cq.answer("Заявка уже обработана", show_alert=True)
@@ -1067,11 +1079,11 @@ async def cb_nft_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> N
         return
 
     user = await get_user_by_id(session, claim.user_id)
-    await log_event(session, "NFT_APPROVED" if approve else "NFT_REJECTED",
-                    cq.from_user.id, {"cid": claim.id})
+    await log_event(session, f"NFT_{action.upper()}", cq.from_user.id, {"cid": claim.id})
     await session.commit()
 
-    verdict = "✅ Одобрено" if approve else "❌ Отклонено"
+    verdict = {"approve": "✅ Одобрено", "reject": "❌ Отклонено",
+               "deny": "🚫 Отказано полностью"}[action]
     base = html.escape(cq.message.text or "")
     try:
         await cq.message.edit_text(f"{base}\n\n{verdict} @{cq.from_user.username or cq.from_user.id}",
@@ -1079,12 +1091,13 @@ async def cb_nft_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> N
     except TelegramBadRequest:
         pass
 
+    user_msgs = {
+        "approve": f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}",
+        "reject": "❌ Заявка на бесплатный NFT отклонена. Можно подать снова.",
+        "deny": "NFT увы, но вы не получите.",
+    }
     try:
-        if approve:
-            msg = f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}"
-        else:
-            msg = "❌ Заявка на бесплатный NFT отклонена."
-        await bot.send_message(user.telegram_id, msg)
+        await bot.send_message(user.telegram_id, user_msgs[action])
     except Exception as exc:
         log.warning("nft notify user failed: %s", exc)
     await cq.answer("Готово")

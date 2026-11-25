@@ -573,34 +573,49 @@ async def get_admin_users(session: AsyncSession) -> list[User]:
 #  FREE NFT
 # ═══════════════════════════════════════════════════════
 # ДОПУЩЕНИЯ:
-#  - заявка создаётся сразу при нажатии кнопки, без дополнительного подтверждения;
-#  - одна заявка на аккаунт: отклонённая тоже блокирует повторную подачу (user_id unique в БД);
-#  - при одобрении юзер пишет админу-контакту из NFT_CONTACT (по умолчанию @support).
+#  - заявка создаётся сразу при нажатии кнопки, без подтверждения;
+#  - отклонённую заявку можно подать снова; пока есть заявка на рассмотрении, новую не подать;
+#  - при повторной подаче (после отказа) админ видит третью кнопку «Отказать полностью»:
+#    она ставит статус DENIED, и юзер больше не может подавать заявки;
+#  - APPROVED: юзер пишет админу-контакту из NFT_CONTACT (по умолчанию @support).
 
-async def get_nft_claim(session: AsyncSession, uid: int) -> Optional[NftClaim]:
-    r = await session.execute(select(NftClaim).where(NftClaim.user_id == uid))
-    return r.scalars().first()
+async def get_nft_claims(session: AsyncSession, uid: int) -> list[NftClaim]:
+    r = await session.execute(select(NftClaim).where(NftClaim.user_id == uid).order_by(NftClaim.id))
+    return list(r.scalars())
+
+
+def nft_state(claims: list[NftClaim]) -> str:
+    """Итоговое состояние по всем заявкам юзера: APPROVED > DENIED > PENDING > REJECTED > NONE."""
+    statuses = {c.status for c in claims}
+    for s in ("APPROVED", "DENIED", "PENDING"):
+        if s in statuses:
+            return s
+    return "REJECTED" if statuses else "NONE"
 
 
 async def create_nft_claim(session: AsyncSession, uid: int) -> NftClaim:
-    """Бросает ValueError, если заявка уже подавалась."""
+    """Бросает ValueError с текстом для юзера, если подать заявку нельзя."""
     # лочим строку юзера, чтобы два быстрых нажатия не создали две заявки
     await session.execute(select(User).where(User.id == uid).with_for_update())
-    r = await session.execute(select(NftClaim).where(NftClaim.user_id == uid))
-    if r.scalars().first():
-        raise ValueError("Бесплатный NFT можно получить только один раз. Заявка уже подавалась.")
+    state = nft_state(await get_nft_claims(session, uid))
+    if state == "APPROVED":
+        raise ValueError("Заявка уже одобрена")
+    if state == "DENIED":
+        raise ValueError("NFT увы, но вы не получите")
+    if state == "PENDING":
+        raise ValueError("Заявка уже на рассмотрении")
     c = NftClaim(user_id=uid, status="PENDING")
     session.add(c)
     await session.flush()
     return c
 
 
-async def decide_nft_claim(session: AsyncSession, cid: int, approve: bool) -> Optional[NftClaim]:
-    """None — заявка не найдена или уже обработана."""
+async def decide_nft_claim(session: AsyncSession, cid: int, action: str) -> Optional[NftClaim]:
+    """action: approve / reject / deny. None — заявка не найдена или уже обработана."""
     r = await session.execute(select(NftClaim).where(NftClaim.id == cid).with_for_update())
     c = r.scalar_one_or_none()
     if not c or c.status != "PENDING":
         return None
-    c.status = "APPROVED" if approve else "REJECTED"
+    c.status = {"approve": "APPROVED", "reject": "REJECTED", "deny": "DENIED"}[action]
     c.decided_at = datetime.utcnow()
     return c

@@ -94,12 +94,17 @@ def back_admin() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def nft_decision(cid: int) -> InlineKeyboardMarkup:
-    """Кнопки админа под заявкой на бесплатный NFT."""
+def nft_decision(cid: int, allow_deny: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки админа под заявкой на бесплатный NFT.
+    allow_deny — третья кнопка «Отказать полностью», только при повторной подаче."""
     b = InlineKeyboardBuilder()
     b.button(text="✅ Одобрить",  callback_data=f"nft:approve:{cid}")
     b.button(text="❌ Отклонить", callback_data=f"nft:reject:{cid}")
-    b.adjust(2)
+    if allow_deny:
+        b.button(text="🚫 Отказать полностью", callback_data=f"nft:deny:{cid}")
+        b.adjust(2, 1)
+    else:
+        b.adjust(2)
     return b.as_markup()
 
 

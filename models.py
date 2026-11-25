@@ -110,11 +110,11 @@ class Withdrawal(Base):
 
 
 class NftClaim(Base):
-    """Заявка на бесплатный NFT. Одна на аккаунт: user_id уникален, отклонённые тоже считаются."""
+    """Заявка на бесплатный NFT. У юзера может быть несколько (после отказов)."""
     __tablename__ = "nft_claims"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), unique=True)
-    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING / APPROVED / REJECTED
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING / APPROVED / REJECTED / DENIED
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
