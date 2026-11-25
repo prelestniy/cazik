@@ -19,3 +19,6 @@ ADMIN_USERNAMES: list[str] = [
 ]
 
 PORT: int = int(os.getenv("PORT", "3000"))
+
+# Юзернейм, куда пишет юзер за бесплатным NFT после одобрения. Если не задан — @support.
+NFT_CONTACT: str = os.getenv("NFT_CONTACT", "@support")

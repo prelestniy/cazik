@@ -2,6 +2,7 @@
 # *handlers — where user intent meets database reality*
 
 from __future__ import annotations
+import html
 import json
 import logging
 from typing import Optional
@@ -14,11 +15,11 @@ from aiogram.exceptions import TelegramBadRequest
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import ADMIN_USERNAMES
+from config import ADMIN_USERNAMES, NFT_CONTACT
 from models import User, SessionMaker
 from services import (
     # user
-    get_rank, get_leaderboard, get_transactions, find_user_admin,
+    get_rank, get_leaderboard, get_transactions, find_user_admin, get_user_by_id,
     block_user, toggle_vip, admin_grant, admin_deduct,
     # game
     play_coinflip, play_dice, play_slots, game_stats,
@@ -31,12 +32,24 @@ from services import (
     SHOP_ITEMS, get_shop_item, process_payment,
     # fmt
     fmt_bal, fmt_winrate, progress_bar, fmt_time_left, fmt_username,
+    # withdraw
+    withdraw_min, cooldown_left, fmt_duration, create_withdrawal,
+    decide_withdrawal, get_admin_users,
+    # free nft
+    create_nft_claim, decide_nft_claim, get_nft_claims, nft_state,
 )
 from keyboards import (
     main_menu, games_menu, back_main, coinflip_choice, dice_choice,
-    shop_keyboard, admin_menu, user_manage, back_admin,
+    shop_keyboard, admin_menu, user_manage, back_admin, withdraw_decision, nft_decision,
 )
-from states import CoinflipSt, DiceSt, SlotsSt, AdminSt
+from states import CoinflipSt, DiceSt, SlotsSt, AdminSt, WithdrawSt, MinesSt, RouletteSt, JokerSt, BjSt, WheelSt
+from keyboards import mines_board, roulette_kinds, bj_actions
+from services import settle_game, calc_payout
+from casino_games import (
+    mines_place, mines_multiplier, MINES_SAFE, roulette_spin, roulette_win, RED_NUMBERS,
+    joker_draw, joker_multiplier, new_deck, hand_value, is_blackjack, blackjack_settle,
+    dealer_play, wheel_spin,
+)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -72,7 +85,7 @@ async def cmd_start(message: Message, db_user: User) -> None:
             f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>"
         )
     else:
-        vip_line = "\n⭐ VIP-статус активен (+10% к выигрышам)" if db_user.is_vip else ""
+        vip_line = "\n⭐ VIP-статус активен (+5% к выигрышам)" if db_user.is_vip else ""
         text = (
             f"👋 С возвращением, <b>{db_user.first_name}</b>!\n\n"
             f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>{vip_line}"
@@ -109,12 +122,12 @@ async def cb_help(cq: CallbackQuery) -> None:
     await cq.answer()
     text = (
         "❓ <b>Помощь</b>\n\n"
-        "🪙 <b>Монетка</b> — угадай орёл/решка. Победа ×2 (VIP ×2.2)\n"
-        "🎲 <b>Кубик</b> — угадай точное число: ×5 (VIP ×5.5)\n"
-        "   Соседнее число: ×1 (VIP ×1.1)\n"
-        "🎰 <b>Слоты</b> — три одинаковых: ×10 (VIP ×11)\n"
-        "   Два одинаковых: ×2 (VIP ×2.2)\n\n"
-        "⭐ VIP-статус даёт +10% к каждому выигрышу\n"
+        "🪙 <b>Монетка</b> — угадай орёл/решка. Победа ×2 (VIP ×2.1)\n"
+        "🎲 <b>Кубик</b> — угадай точное число: ×5 (VIP ×5.25)\n"
+        "   Соседнее число: ×1 (VIP ×1.05)\n"
+        "🎰 <b>Слоты</b> — три одинаковых: ×10 (VIP ×10.5)\n"
+        "   Два одинаковых: ×2 (VIP ×2.1)\n\n"
+        "⭐ VIP-статус даёт +5% к каждому выигрышу\n"
         "📋 Задания обновляются каждый день в 00:00 UTC"
     )
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
@@ -305,7 +318,7 @@ async def cb_buy_item(cq: CallbackQuery, bot: Bot) -> None:
     item = get_shop_item(item_id)
     if not item:
         return
-    desc = "VIP-статус: +10% к каждому выигрышу" if item["is_vip"] else f"{item['points']} виртуальных очков"
+    desc = "VIP-статус: +5% к каждому выигрышу" if item["is_vip"] else f"{item['points']} виртуальных очков"
     await bot.send_invoice(
         chat_id=cq.from_user.id,
         title=item["title"],
@@ -339,7 +352,7 @@ async def on_payment(message: Message, db_user: User, session: AsyncSession) -> 
         await message.answer("✅ Платёж уже обработан ранее.")
         return
     if item["is_vip"]:
-        text = "⭐ <b>VIP-статус активирован!</b>\n\nТеперь вы получаете +10% к каждому выигрышу."
+        text = "⭐ <b>VIP-статус активирован!</b>\n\nТеперь вы получаете +5% к каждому выигрышу."
     else:
         text = (
             f"✅ <b>Успешная покупка!</b>\n\n"
@@ -356,13 +369,13 @@ async def on_payment(message: Message, db_user: User, session: AsyncSession) -> 
 async def cb_coinflip_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
                              state: FSMContext) -> None:
     await cq.answer()
-    mn = int(await get_config(session, "coinflip.min_bet", "10"))
-    mx = int(await get_config(session, "coinflip.max_bet", "500"))
+    mn = 1  # без минимума: только больше 0
+    mx = None  # без максимума
     text = (
         f"🪙 <b>Монетка</b>\n\n"
         f"💰 Баланс: {fmt_bal(db_user.balance)} очков\n"
-        f"📌 Ставка: {mn} – {mx} очков\n"
-        f"🏆 Победа: ×{'2.2' if db_user.is_vip else '2'}\n\n"
+        f"📌 Ставка: от {mn} очков, без максимума\n"
+        f"🏆 Победа: ×{'2.1' if db_user.is_vip else '2'}\n\n"
         f"Введи сумму ставки:"
     )
     await state.set_state(CoinflipSt.bet)
@@ -376,11 +389,11 @@ async def msg_coinflip_bet(message: Message, db_user: User, state: FSMContext,
     data = await state.get_data()
     mn, mx = data["min_bet"], data["max_bet"]
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Введи число от {mn} до {mx}:")
+        await message.answer(f"❌ Введи целое число больше 0:")
         return
     bet = int(message.text.strip())
-    if bet < mn or bet > mx:
-        await message.answer(f"❌ Ставка должна быть от {mn} до {mx} очков:")
+    if bet < mn:
+        await message.answer(f"❌ Ставка должна быть не меньше {mn} очков:")
         return
     if db_user.balance < bet:
         await message.answer(f"❌ Недостаточно очков. Баланс: {fmt_bal(db_user.balance)}")
@@ -425,9 +438,12 @@ async def cb_coinflip_play(cq: CallbackQuery, db_user: User, session: AsyncSessi
         f"{result_text}\n\n"
         f"💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
     )
+    # advance tasks — same session; a loss resets WIN_STREAK progress
     await advance_task(session, db_user.id, "PLAY_GAMES")
     if out.won:
         await advance_task(session, db_user.id, "WIN_STREAK")
+    else:
+        await advance_task(session, db_user.id, "WIN_STREAK", inc=-999)
     await session.commit()
 
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
@@ -441,14 +457,14 @@ async def cb_coinflip_play(cq: CallbackQuery, db_user: User, session: AsyncSessi
 async def cb_dice_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
                          state: FSMContext) -> None:
     await cq.answer()
-    mn = int(await get_config(session, "dice.min_bet", "10"))
-    mx = int(await get_config(session, "dice.max_bet", "300"))
+    mn = 1  # без минимума: только больше 0
+    mx = None  # без максимума
     text = (
         f"🎲 <b>Кубик</b>\n\n"
         f"💰 Баланс: {fmt_bal(db_user.balance)} очков\n"
-        f"📌 Ставка: {mn} – {mx} очков\n"
-        f"🏆 Точное попадание: ×{'5.5' if db_user.is_vip else '5'}\n"
-        f"🎯 Соседнее число (±1): ×{'1.1' if db_user.is_vip else '1'}\n\n"
+        f"📌 Ставка: от {mn} очков, без максимума\n"
+        f"🏆 Точное попадание: ×{'5.25' if db_user.is_vip else '5'}\n"
+        f"🎯 Соседнее число (±1): ×{'1.05' if db_user.is_vip else '1'}\n\n"
         f"Введи сумму ставки:"
     )
     await state.set_state(DiceSt.bet)
@@ -462,11 +478,11 @@ async def msg_dice_bet(message: Message, db_user: User, state: FSMContext,
     data = await state.get_data()
     mn, mx = data["min_bet"], data["max_bet"]
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Введи число от {mn} до {mx}:")
+        await message.answer(f"❌ Введи целое число больше 0:")
         return
     bet = int(message.text.strip())
-    if bet < mn or bet > mx:
-        await message.answer(f"❌ Ставка должна быть от {mn} до {mx} очков:")
+    if bet < mn:
+        await message.answer(f"❌ Ставка должна быть не меньше {mn} очков:")
         return
     if db_user.balance < bet:
         await message.answer(f"❌ Недостаточно очков. Баланс: {fmt_bal(db_user.balance)}")
@@ -512,6 +528,8 @@ async def cb_dice_play(cq: CallbackQuery, db_user: User, session: AsyncSession) 
     await advance_task(session, db_user.id, "PLAY_GAMES")
     if out.won:
         await advance_task(session, db_user.id, "WIN_STREAK")
+    else:
+        await advance_task(session, db_user.id, "WIN_STREAK", inc=-999)  # reset streak
     await session.commit()
 
     await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
@@ -525,14 +543,14 @@ async def cb_dice_play(cq: CallbackQuery, db_user: User, session: AsyncSession) 
 async def cb_slots_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
                           state: FSMContext) -> None:
     await cq.answer()
-    mn = int(await get_config(session, "slots.min_bet", "20"))
-    mx = int(await get_config(session, "slots.max_bet", "200"))
+    mn = 1  # без минимума: только больше 0
+    mx = None  # без максимума
     text = (
         f"🎰 <b>Слоты</b>\n\n"
         f"💰 Баланс: {fmt_bal(db_user.balance)} очков\n"
-        f"📌 Ставка: {mn} – {mx} очков\n"
-        f"🏆 Три одинаковых: ×{'11' if db_user.is_vip else '10'}\n"
-        f"🎯 Два одинаковых: ×{'2.2' if db_user.is_vip else '2'}\n\n"
+        f"📌 Ставка: от {mn} очков, без максимума\n"
+        f"🏆 Три одинаковых: ×{'10.5' if db_user.is_vip else '10'}\n"
+        f"🎯 Два одинаковых: ×{'2.1' if db_user.is_vip else '2'}\n\n"
         f"Введи сумму ставки:"
     )
     await state.set_state(SlotsSt.bet)
@@ -546,11 +564,11 @@ async def msg_slots_bet(message: Message, db_user: User, state: FSMContext,
     data = await state.get_data()
     mn, mx = data["min_bet"], data["max_bet"]
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Введи число от {mn} до {mx}:")
+        await message.answer(f"❌ Введи целое число больше 0:")
         return
     bet = int(message.text.strip())
-    if bet < mn or bet > mx:
-        await message.answer(f"❌ Ставка должна быть от {mn} до {mx} очков:")
+    if bet < mn:
+        await message.answer(f"❌ Ставка должна быть не меньше {mn} очков:")
         return
     if db_user.balance < bet:
         await message.answer(f"❌ Недостаточно очков. Баланс: {fmt_bal(db_user.balance)}")
@@ -577,11 +595,12 @@ async def msg_slots_bet(message: Message, db_user: User, state: FSMContext,
         f"{result_text}\n\n"
         f"💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
     )
-    async with SessionMaker() as s2:
-        await advance_task(s2, db_user.id, "PLAY_GAMES")
-        if out.won:
-            await advance_task(s2, db_user.id, "WIN_STREAK")
-        await s2.commit()
+    await advance_task(session, db_user.id, "PLAY_GAMES")
+    if out.won:
+        await advance_task(session, db_user.id, "WIN_STREAK")
+    else:
+        await advance_task(session, db_user.id, "WIN_STREAK", inc=-999)  # reset streak
+    await session.commit()
 
     await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
 
@@ -711,34 +730,50 @@ async def msg_admin_find(message: Message, state: FSMContext, session: AsyncSess
 async def cb_admin_block(cq: CallbackQuery, session: AsyncSession) -> None:
     if not _is_admin(cq.from_user.username):
         await cq.answer("⛔"); return
-    parts   = cq.data.split(":")
-    uid, v  = int(parts[2]), bool(int(parts[3]))
-    updated = await block_user(session, uid, v)
-    await log_event(session, "ADMIN_BLOCK_TOGGLE", cq.from_user.id, {"uid": uid, "blocked": v})
-    await session.commit()
-    await cq.answer("🚫 Заблокирован" if v else "✅ Разблокирован")
+    parts  = cq.data.split(":")
+    uid, v = int(parts[2]), bool(int(parts[3]))
     try:
-        await cq.message.edit_reply_markup(
-            reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
-    except TelegramBadRequest:
-        pass
+        updated = await block_user(session, uid, v)
+        await log_event(session, "ADMIN_BLOCK_TOGGLE", cq.from_user.id, {"uid": uid, "blocked": v})
+        await session.commit()
+        await cq.answer("🚫 Заблокирован" if v else "✅ Разблокирован", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(
+                reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
+        except TelegramBadRequest:
+            pass
+    except ValueError as e:
+        await session.rollback()
+        await cq.answer(f"❌ {e}", show_alert=True)
+    except Exception as e:
+        await session.rollback()
+        log.error("block_user failed uid=%s: %s", uid, e)
+        await cq.answer("❌ Ошибка при блокировке", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin:vip:"))
 async def cb_admin_vip(cq: CallbackQuery, session: AsyncSession) -> None:
     if not _is_admin(cq.from_user.username):
         await cq.answer("⛔"); return
-    parts   = cq.data.split(":")
-    uid, v  = int(parts[2]), bool(int(parts[3]))
-    updated = await toggle_vip(session, uid, v)
-    await log_event(session, "ADMIN_VIP_TOGGLE", cq.from_user.id, {"uid": uid, "vip": v})
-    await session.commit()
-    await cq.answer("⭐ VIP выдан" if v else "❌ VIP снят")
+    parts  = cq.data.split(":")
+    uid, v = int(parts[2]), bool(int(parts[3]))
     try:
-        await cq.message.edit_reply_markup(
-            reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
-    except TelegramBadRequest:
-        pass
+        updated = await toggle_vip(session, uid, v)
+        await log_event(session, "ADMIN_VIP_TOGGLE", cq.from_user.id, {"uid": uid, "vip": v})
+        await session.commit()
+        await cq.answer("⭐ VIP выдан" if v else "❌ VIP снят", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(
+                reply_markup=user_manage(uid, updated.is_blocked, updated.is_vip))
+        except TelegramBadRequest:
+            pass
+    except ValueError as e:
+        await session.rollback()
+        await cq.answer(f"❌ {e}", show_alert=True)
+    except Exception as e:
+        await session.rollback()
+        log.error("toggle_vip failed uid=%s: %s", uid, e)
+        await cq.answer("❌ Ошибка при изменении VIP", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin:grant:"))
@@ -841,6 +876,564 @@ async def msg_admin_broadcast(message: Message, bot: Bot, state: FSMContext,
 # ═══════════════════════════════════════════════════════
 #  FALLBACK
 # ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════
+#  WITHDRAW (вывод очков, одобряет админ)
+# ═══════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "menu:withdraw")
+async def cb_withdraw_start(cq: CallbackQuery, db_user: User, session: AsyncSession,
+                            state: FSMContext) -> None:
+    await cq.answer()
+    await state.clear()
+    left = await cooldown_left(session, db_user.id)
+    if left:
+        text = (
+            "💸 <b>Вывод очков</b>\n\n"
+            f"⏳ Заявка уже подана сегодня. Следующая будет доступна через <b>{fmt_duration(left)}</b>"
+        )
+        await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
+        return
+    mn = withdraw_min(db_user)
+    text = (
+        "💸 <b>Вывод очков</b>\n\n"
+        f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>\n"
+        f"📌 Минимум: {fmt_bal(mn)} очков{' (VIP)' if db_user.is_vip else ''}\n"
+        "📅 Одна заявка в сутки, максимума нет\n\n"
+        "Введи сумму для вывода:"
+    )
+    await state.set_state(WithdrawSt.amount)
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
+
+
+@router.message(WithdrawSt.amount)
+async def msg_withdraw_amount(message: Message, bot: Bot, db_user: User, state: FSMContext,
+                              session: AsyncSession) -> None:
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("❌ Введи целое число очков:")
+        return
+    try:
+        w = await create_withdrawal(session, db_user.id, int(txt))
+    except ValueError as e:
+        # ничего не менялось до raise, откат не нужен (и опасен: сбрасывает db_user)
+        await message.answer(f"❌ {e}")
+        if "в сутки" in str(e):
+            await state.clear()
+        return
+
+    # уведомляем админов с кнопками; если никто не получил — заявку не создаём
+    text = (
+        f"💸 <b>Заявка на вывод #{w.id}</b>\n"
+        f"👤 {html.escape(fmt_username(db_user))} (tg: <code>{db_user.telegram_id}</code>)\n"
+        f"💰 Сумма: <b>{fmt_bal(w.amount)} очков</b>\n"
+        f"⭐ VIP: {'да' if db_user.is_vip else 'нет'}"
+    )
+    sent = 0
+    for adm in await get_admin_users(session):
+        try:
+            await bot.send_message(adm.telegram_id, text, parse_mode="HTML",
+                                   reply_markup=withdraw_decision(w.id))
+            sent += 1
+        except Exception as exc:
+            log.warning("withdraw notify failed admin=%s: %s", adm.telegram_id, exc)
+
+    if sent == 0:
+        await session.rollback()
+        await state.clear()
+        await message.answer("❌ Заявка не отправлена: админы недоступны. Очки не списаны, попробуй позже.")
+        return
+
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ Заявка #{w.id} на <b>{fmt_bal(w.amount)} очков</b> отправлена.\n"
+        "Ответ придёт сюда после проверки.",
+        parse_mode="HTML", reply_markup=back_main(),
+    )
+
+
+@router.callback_query(F.data.startswith("wd:"))
+async def cb_withdraw_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    if not _is_admin(cq.from_user.username):
+        await cq.answer("⛔"); return
+    _, action, wid_s = cq.data.split(":")
+    approve = action == "approve"
+    w = await decide_withdrawal(session, int(wid_s), approve)
+    if w is None:
+        await session.rollback()
+        await cq.answer("Заявка уже обработана", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        return
+
+    user = await get_user_by_id(session, w.user_id)
+    await log_event(session, "WITHDRAW_APPROVED" if approve else "WITHDRAW_REJECTED",
+                    cq.from_user.id, {"wid": w.id, "amount": w.amount})
+    await session.commit()
+
+    # убираем кнопки и дописываем решение в сообщение админа
+    verdict = "✅ Одобрено" if approve else "❌ Отклонено, очки возвращены"
+    base = html.escape(cq.message.text or "")
+    try:
+        await cq.message.edit_text(f"{base}\n\n{verdict} @{cq.from_user.username or cq.from_user.id}",
+                                   parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+
+    # ответ юзеру
+    try:
+        if approve:
+            msg = f"✅ Вывод <b>{fmt_bal(w.amount)} очков</b> (заявка #{w.id}) одобрен."
+        else:
+            msg = (f"❌ Заявка #{w.id} на вывод отклонена. "
+                   f"<b>{fmt_bal(w.amount)} очков</b> вернулись на баланс.")
+        await bot.send_message(user.telegram_id, msg, parse_mode="HTML")
+    except Exception as exc:
+        log.warning("withdraw notify user failed: %s", exc)
+    await cq.answer("Готово")
+
+
+# ═══════════════════════════════════════════════════════
+#  FREE NFT (админ одобряет; после отказа можно подать снова)
+# ═══════════════════════════════════════════════════════
+
+async def _notify_admins(bot: Bot, session: AsyncSession, text: str, markup) -> int:
+    """Отправляет сообщение всем админам, возвращает сколько доставлено."""
+    sent = 0
+    for adm in await get_admin_users(session):
+        try:
+            await bot.send_message(adm.telegram_id, text, parse_mode="HTML", reply_markup=markup)
+            sent += 1
+        except Exception as exc:
+            log.warning("notify admin failed admin=%s: %s", adm.telegram_id, exc)
+    return sent
+
+
+def _nft_contact() -> str:
+    c = NFT_CONTACT.strip()
+    return c if c.startswith("@") else f"@{c}"
+
+
+@router.callback_query(F.data == "menu:nft")
+async def cb_nft_start(cq: CallbackQuery, bot: Bot, db_user: User, session: AsyncSession) -> None:
+    claims = await get_nft_claims(session, db_user.id)
+    state = nft_state(claims)
+
+    # ответы без новых сообщений админам
+    if state == "APPROVED":
+        text = ("🎁 <b>Бесплатный NFT</b>\n\n✅ Заявка одобрена. "
+                f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}")
+        await cq.answer()
+        await _safe_edit(cq, text, parse_mode="HTML", reply_markup=back_main())
+        return
+    if state == "DENIED":
+        await cq.answer()
+        await _safe_edit(cq, "🎁 <b>Бесплатный NFT</b>\n\n🚫 NFT увы, но вы не получите.",
+                         parse_mode="HTML", reply_markup=back_main())
+        return
+    if state == "PENDING":
+        await cq.answer()
+        await _safe_edit(cq, "🎁 <b>Бесплатный NFT</b>\n\n⏳ Заявка на рассмотрении. Ответ придёт сюда после проверки.",
+                         parse_mode="HTML", reply_markup=back_main())
+        return
+
+    # новая заявка или подача после отказа
+    resubmit = bool(claims)
+    try:
+        claim = await create_nft_claim(session, db_user.id)
+    except ValueError as e:
+        await cq.answer(str(e), show_alert=True)
+        return
+
+    admin_text = (
+        f"🎁 <b>Заявка на бесплатный NFT #{claim.id}</b>"
+        f"{' (повторная)' if resubmit else ''}\n"
+        f"👤 {html.escape(fmt_username(db_user))} (tg: <code>{db_user.telegram_id}</code>)"
+    )
+    if await _notify_admins(bot, session, admin_text, nft_decision(claim.id, allow_deny=resubmit)) == 0:
+        await session.rollback()  # заявку не создаём, чтобы юзер мог попробовать позже
+        await cq.answer("❌ Заявка не отправлена: админы недоступны. Попробуй позже.", show_alert=True)
+        return
+
+    await session.commit()
+    await cq.answer()
+    await _safe_edit(
+        cq,
+        "🎁 <b>Бесплатный NFT</b>\n\n✅ Заявка отправлена. Ответ придёт сюда после проверки.",
+        parse_mode="HTML", reply_markup=back_main(),
+    )
+
+
+@router.callback_query(F.data.startswith("nft:"))
+async def cb_nft_decide(cq: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
+    if not _is_admin(cq.from_user.username):
+        await cq.answer("⛔"); return
+    _, action, cid_s = cq.data.split(":")
+    if action not in ("approve", "reject", "deny"):
+        await cq.answer("❓ Неизвестное действие"); return
+
+    claim = await decide_nft_claim(session, int(cid_s), action)
+    if claim is None:
+        await session.rollback()
+        await cq.answer("Заявка уже обработана", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        return
+
+    user = await get_user_by_id(session, claim.user_id)
+    await log_event(session, f"NFT_{action.upper()}", cq.from_user.id, {"cid": claim.id})
+    await session.commit()
+
+    verdict = {"approve": "✅ Одобрено", "reject": "❌ Отклонено",
+               "deny": "🚫 Отказано полностью"}[action]
+    base = html.escape(cq.message.text or "")
+    try:
+        await cq.message.edit_text(f"{base}\n\n{verdict} @{cq.from_user.username or cq.from_user.id}",
+                                   parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+
+    user_msgs = {
+        "approve": f"Напишите сюда за своим бесплатным NFT: {_nft_contact()}",
+        "reject": "❌ Заявка на бесплатный NFT отклонена. Можно подать снова.",
+        "deny": "NFT увы, но вы не получите.",
+    }
+    try:
+        await bot.send_message(user.telegram_id, user_msgs[action])
+    except Exception as exc:
+        log.warning("nft notify user failed: %s", exc)
+    await cq.answer("Готово")
+
+
+# ═══════════════════════════════════════════════════════
+#  NEW GAMES: мины, рулетка, джокер, блэкджек, колесо
+#  Правила и множители — в casino_games.py. Ставка от NEW_MIN_BET, без максимума.
+# ═══════════════════════════════════════════════════════
+
+NEW_MIN_BET = 100
+
+RULES = {
+    "mines": "Поле 5×5, 3 мины. Открывай клетки: каждая безопасная поднимает множитель. "
+             "Забрать можно в любой момент. На мине ставка сгорает.",
+    "roulette": "Числа 0–36. Цвет или чётное/нечётное ×2, конкретное число ×36. "
+                "0 зелёный: на цвет и чётность ставка проигрывает.",
+    "joker": "Одна карта из 53 (с джокером). Джокер ×3, J/Q/K/A ×2, остальные проигрыш.",
+    "blackjack": "Дилер берёт до 17. Победа ×2, блэкджек ×2.5, ничья — возврат ставки. Перебор — проигрыш.",
+    "wheel": "8 секторов от ×0 до ×10. Сектор выпадает случайно, с весом.",
+}
+
+
+def _bet_prompt(title: str, key: str, db_user: User) -> str:
+    return (f"{title}\n\n{RULES[key]}\n\n"
+            f"💰 Баланс: <b>{fmt_bal(db_user.balance)} очков</b>\n"
+            f"📌 Ставка: от {NEW_MIN_BET}, без максимума\n\n"
+            "Введи сумму ставки:")
+
+
+def _check_bet(text: Optional[str], balance: int) -> tuple[Optional[int], Optional[str]]:
+    t = (text or "").strip()
+    if not t.isdigit():
+        return None, f"❌ Введи целое число, от {NEW_MIN_BET}:"
+    bet = int(t)
+    if bet < NEW_MIN_BET:
+        return None, f"❌ Минимальная ставка {NEW_MIN_BET} очков:"
+    if bet > balance:
+        return None, f"❌ Недостаточно очков. Баланс: {fmt_bal(balance)}"
+    return bet, None
+
+
+async def _start_bet(cq: CallbackQuery, db_user: User, state: FSMContext,
+                     key: str, title: str, bet_state) -> None:
+    await cq.answer()
+    await state.clear()
+    await state.set_state(bet_state)
+    await _safe_edit(cq, _bet_prompt(title, key, db_user), parse_mode="HTML", reply_markup=back_main())
+
+
+async def _after_game(session: AsyncSession, uid: int, won: bool) -> None:
+    await advance_task(session, uid, "PLAY_GAMES")
+    if won:
+        await advance_task(session, uid, "WIN_STREAK")
+    else:
+        await advance_task(session, uid, "WIN_STREAK", inc=-999)  # проигрыш сбрасывает серию
+
+
+async def _settle_report(session: AsyncSession, db_user: User, bet: int, game_type: str,
+                         base_mult: float, result: str, title: str, detail: str) -> str:
+    """Расчёт ставки + текст результата. При ошибке баланса возвращает текст ошибки."""
+    try:
+        out = await settle_game(session, db_user, game_type, bet, result, base_mult)
+    except ValueError as e:
+        return f"❌ {e}"
+    await _after_game(session, db_user.id, out.won)
+    await session.commit()
+    if out.won:
+        head = f"🎉 <b>Выиграл!</b> +{fmt_bal(out.payout - bet)} очков"
+    elif out.payout == bet:
+        head = "🤝 <b>Ничья</b>, ставка возвращена"
+    else:
+        head = f"💀 <b>Проигрыш</b> −{fmt_bal(bet)} очков"
+    return f"{title}\n\n{detail}\n\n{head}\n💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
+
+
+# ─── МИНЫ ───────────────────────────────────────────────
+
+def _mines_text(bet: int, opened: list[int], db_user: User) -> str:
+    k = len(opened)
+    mult = mines_multiplier(k)
+    text = (f"💣 <b>Мины</b>\nСтавка: {fmt_bal(bet)}\n"
+            f"Открыто безопасных: {k}/{MINES_SAFE}\nМножитель: ×{mult:.2f}")
+    if k:
+        text += f"\nЗабрать: <b>{fmt_bal(calc_payout(db_user, bet, mult))}</b>"
+    return text
+
+
+@router.callback_query(F.data == "game:mines")
+async def cb_mines_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "mines", "💣 <b>Мины</b>", MinesSt.bet)
+
+
+@router.message(MinesSt.bet)
+async def msg_mines_bet(message: Message, db_user: User, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    await state.set_state(MinesSt.playing)
+    await state.update_data(bet=bet, mines=mines_place(), opened=[])
+    await message.answer(_mines_text(bet, [], db_user), parse_mode="HTML",
+                         reply_markup=mines_board([], None, None))
+
+
+@router.callback_query(F.data.startswith("mines:"))
+async def cb_mines_play(cq: CallbackQuery, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    if await state.get_state() != MinesSt.playing.state:
+        await cq.answer("Игра уже закончилась", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    if parts[1] == "noop":
+        await cq.answer()
+        return
+    data = await state.get_data()
+    bet, mines, opened = data["bet"], data["mines"], list(data["opened"])
+
+    if parts[1] == "cash":
+        if not opened:
+            await cq.answer("Сначала открой клетку", show_alert=True)
+            return
+        await cq.answer()
+        await _mines_end(cq, session, db_user, state, bet, opened, mines, win=True)
+        return
+
+    i = int(parts[2])
+    if i in opened:
+        await cq.answer()
+        return
+    await cq.answer()
+    if i in mines:
+        await _mines_end(cq, session, db_user, state, bet, opened, mines, win=False)
+        return
+
+    opened.append(i)
+    if len(opened) == MINES_SAFE:  # все безопасные открыты — авто-забор
+        await _mines_end(cq, session, db_user, state, bet, opened, mines, win=True)
+        return
+    await state.update_data(opened=opened)
+    pay = calc_payout(db_user, bet, mines_multiplier(len(opened)))
+    await _safe_edit(cq, _mines_text(bet, opened, db_user), parse_mode="HTML",
+                     reply_markup=mines_board(opened, None, f"💰 Забрать {fmt_bal(pay)}"))
+
+
+async def _mines_end(cq: CallbackQuery, session: AsyncSession, db_user: User, state: FSMContext,
+                     bet: int, opened: list[int], mines: list[int], win: bool) -> None:
+    k = len(opened)
+    base = mines_multiplier(k) if win else 0.0
+    result = f"cash:{k}" if win else f"boom:{k}"
+    try:
+        out = await settle_game(session, db_user, "MINES", bet, result, base)
+    except ValueError as e:
+        await state.clear()
+        await _safe_edit(cq, f"❌ {e}", reply_markup=back_main())
+        return
+    await _after_game(session, db_user.id, out.won)
+    await session.commit()
+    await state.clear()
+    if win:
+        head = f"💎 <b>Забрал!</b> ×{base:.2f}, +{fmt_bal(out.payout - bet)} очков"
+    else:
+        head = f"💥 <b>Мина!</b> Ставка {fmt_bal(bet)} сгорела"
+    text = f"💣 <b>Мины</b>\n\n{head}\n💰 Баланс: <b>{fmt_bal(out.new_balance)} очков</b>"
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=mines_board(opened, mines, None))
+
+
+# ─── РУЛЕТКА ────────────────────────────────────────────
+
+async def _roulette_play(session: AsyncSession, db_user: User, bet: int, kind: str,
+                         pick: Optional[int]) -> str:
+    spin = roulette_spin()
+    _, mult = roulette_win(kind, pick, spin)
+    color = "🟢" if spin == 0 else ("🔴" if spin in RED_NUMBERS else "⚫")
+    return await _settle_report(session, db_user, bet, "ROULETTE", mult, f"{spin}:{kind}",
+                                "🎡 <b>Рулетка</b>", f"Выпало: {color} <b>{spin}</b>")
+
+
+@router.callback_query(F.data == "game:roulette")
+async def cb_roulette_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "roulette", "🎡 <b>Рулетка</b>", RouletteSt.bet)
+
+
+@router.message(RouletteSt.bet)
+async def msg_roulette_bet(message: Message, db_user: User, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    await state.update_data(bet=bet)
+    await state.set_state(RouletteSt.kind)
+    await message.answer(f"🎡 Ставка <b>{fmt_bal(bet)}</b>. Выбери ставку:", parse_mode="HTML",
+                         reply_markup=roulette_kinds())
+
+
+@router.callback_query(F.data.startswith("roul:"))
+async def cb_roulette_kind(cq: CallbackQuery, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    if await state.get_state() != RouletteSt.kind.state:
+        await cq.answer("Начни игру заново", show_alert=True)
+        return
+    kind = cq.data.split(":")[1]
+    await cq.answer()
+    if kind == "num":
+        await state.set_state(RouletteSt.number)
+        await cq.message.answer("🎯 Введи число от 0 до 36:")
+        return
+    bet = (await state.get_data())["bet"]
+    await state.clear()
+    text = await _roulette_play(session, db_user, bet, kind, None)
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
+
+
+@router.message(RouletteSt.number)
+async def msg_roulette_number(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    t = (message.text or "").strip()
+    if not t.isdigit() or not 0 <= int(t) <= 36:
+        await message.answer("❌ Введи число от 0 до 36:")
+        return
+    bet = (await state.get_data())["bet"]
+    await state.clear()
+    text = await _roulette_play(session, db_user, bet, "number", int(t))
+    await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+
+
+# ─── ДЖОКЕР ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "game:joker")
+async def cb_joker_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "joker", "🃏 <b>Джокер</b>", JokerSt.bet)
+
+
+@router.message(JokerSt.bet)
+async def msg_joker_bet(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    card = joker_draw()
+    mult = joker_multiplier(card)
+    await state.clear()
+    text = await _settle_report(session, db_user, bet, "JOKER", mult, card,
+                                "🃏 <b>Джокер</b>", f"Карта: <b>{card}</b> (×{mult:g})")
+    await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+
+
+# ─── БЛЭКДЖЕК ───────────────────────────────────────────
+
+def _bj_table(player: list[str], dealer: list[str], hidden: bool) -> str:
+    dealer_str = f"{dealer[0]} 🂠" if hidden else f"{' '.join(dealer)} = {hand_value(dealer)}"
+    return (f"🃏 <b>Блэкджек</b>\nДилер: {dealer_str}\n"
+            f"Ты: {' '.join(player)} = {hand_value(player)}")
+
+
+@router.callback_query(F.data == "game:blackjack")
+async def cb_bj_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "blackjack", "🃏 <b>Блэкджек</b>", BjSt.bet)
+
+
+@router.message(BjSt.bet)
+async def msg_bj_bet(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    deck = new_deck()
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+    if is_blackjack(player):  # натуральный блэкджек — сразу расчёт
+        outcome, mult = blackjack_settle(player, dealer)
+        await state.clear()
+        text = await _settle_report(session, db_user, bet, "BLACKJACK", mult, outcome,
+                                    "🃏 <b>Блэкджек</b>", _bj_table(player, dealer, hidden=False))
+        await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+        return
+    await state.set_state(BjSt.playing)
+    await state.update_data(bet=bet, deck=deck, player=player, dealer=dealer)
+    await message.answer(_bj_table(player, dealer, hidden=True) + f"\n\nСтавка: {fmt_bal(bet)}",
+                         parse_mode="HTML", reply_markup=bj_actions())
+
+
+@router.callback_query(F.data.in_({"bj:hit", "bj:stand"}))
+async def cb_bj_play(cq: CallbackQuery, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    if await state.get_state() != BjSt.playing.state:
+        await cq.answer("Игра уже закончилась", show_alert=True)
+        return
+    await cq.answer()
+    data = await state.get_data()
+    bet, deck, player, dealer = data["bet"], data["deck"], data["player"], data["dealer"]
+
+    if cq.data == "bj:hit":
+        player.append(deck.pop())
+        if hand_value(player) > 21:  # перебор
+            await state.clear()
+            text = await _settle_report(session, db_user, bet, "BLACKJACK", 0.0, "bust",
+                                        "🃏 <b>Блэкджек</b>", _bj_table(player, dealer, hidden=False))
+            await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
+            return
+        await state.update_data(deck=deck, player=player)
+        await _safe_edit(cq, _bj_table(player, dealer, hidden=True) + f"\n\nСтавка: {fmt_bal(bet)}",
+                         parse_mode="HTML", reply_markup=bj_actions())
+        return
+
+    # stand: дилер добирает до 17, потом расчёт
+    dealer_play(dealer, deck)
+    outcome, mult = blackjack_settle(player, dealer)
+    await state.clear()
+    text = await _settle_report(session, db_user, bet, "BLACKJACK", mult, outcome,
+                                "🃏 <b>Блэкджек</b>", _bj_table(player, dealer, hidden=False))
+    await _safe_edit(cq, text, parse_mode="HTML", reply_markup=games_menu())
+
+
+# ─── КОЛЕСО ФОРТУНЫ ─────────────────────────────────────
+
+@router.callback_query(F.data == "game:wheel")
+async def cb_wheel_start(cq: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await _start_bet(cq, db_user, state, "wheel", "🎠 <b>Колесо фортуны</b>", WheelSt.bet)
+
+
+@router.message(WheelSt.bet)
+async def msg_wheel_bet(message: Message, db_user: User, session: AsyncSession, state: FSMContext) -> None:
+    bet, err = _check_bet(message.text, db_user.balance)
+    if err:
+        await message.answer(err)
+        return
+    mult = wheel_spin()
+    await state.clear()
+    text = await _settle_report(session, db_user, bet, "WHEEL", mult, f"x{mult:g}",
+                                "🎠 <b>Колесо фортуны</b>", f"Сектор: <b>×{mult:g}</b>")
+    await message.answer(text, parse_mode="HTML", reply_markup=games_menu())
+
 
 @router.callback_query()
 async def cb_fallback(cq: CallbackQuery) -> None:

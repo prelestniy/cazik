@@ -11,7 +11,8 @@ from typing import Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_, case
 
-from models import User, GameResult, Transaction, Task, UserTask, GameConfig, SystemEvent
+from models import User, GameResult, Transaction, Task, UserTask, GameConfig, SystemEvent, Withdrawal, NftClaim
+from config import ADMIN_USERNAMES
 
 log = logging.getLogger(__name__)
 
@@ -102,13 +103,19 @@ async def get_rank(session: AsyncSession, user: User) -> int:
 
 async def block_user(session: AsyncSession, uid: int, blocked: bool) -> User:
     user = await get_user_by_id(session, uid)
+    if user is None:
+        raise ValueError(f"User #{uid} not found")
     user.is_blocked = blocked
+    await session.flush()
     return user
 
 
 async def toggle_vip(session: AsyncSession, uid: int, vip: bool) -> User:
     user = await get_user_by_id(session, uid)
+    if user is None:
+        raise ValueError(f"User #{uid} not found")
     user.is_vip = vip
+    await session.flush()
     return user
 
 
@@ -172,6 +179,14 @@ async def find_user_admin(session: AsyncSession, query: str) -> Optional[User]:
 #  GAME SERVICE
 # ═══════════════════════════════════════════════════════
 
+# VIP даёт +5% к каждому выигрышу (множитель к базовому коэффициенту)
+VIP_MULT = 1.05
+
+
+def _vip(user: User) -> float:
+    return VIP_MULT if user.is_vip else 1.0
+
+
 SLOT_SYMS = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎"]
 
 
@@ -209,7 +224,7 @@ async def play_coinflip(session: AsyncSession, user: User,
                         bet: int, choice: str) -> GameOut:
     roll = "heads" if random.random() < 0.5 else "tails"
     won = roll == choice
-    mult = (2.2 if user.is_vip else 2.0) if won else 0.0
+    mult = (2.0 * _vip(user)) if won else 0.0
     payout = int(bet * mult)
     return await _commit_game(session, user, "COINFLIP", bet, roll, payout, won)
 
@@ -220,9 +235,9 @@ async def play_dice(session: AsyncSession, user: User,
     exact = roll == guess
     adjacent = not exact and abs(roll - guess) == 1
     if exact:
-        mult = 5.5 if user.is_vip else 5.0
+        mult = 5.0 * _vip(user)
     elif adjacent:
-        mult = 1.1 if user.is_vip else 1.0
+        mult = 1.0 * _vip(user)
     else:
         mult = 0.0
     won = exact or adjacent
@@ -236,9 +251,9 @@ async def play_slots(session: AsyncSession, user: User, bet: int) -> GameOut:
     all3 = reels[0] == reels[1] == reels[2]
     two  = not all3 and (reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2])
     if all3:
-        mult = 11.0 if user.is_vip else 10.0
+        mult = 10.0 * _vip(user)
     elif two:
-        mult = 2.2 if user.is_vip else 2.0
+        mult = 2.0 * _vip(user)
     else:
         mult = 0.0
     won = all3 or two
@@ -397,7 +412,8 @@ async def advance_task(session: AsyncSession, uid: int, task_type: str, inc: int
                UserTask.expires_at > now, Task.type == task_type)
     )
     for ut, t in r.all():
-        ut.progress = min(ut.progress + inc, t.target)
+        # clamp to [0, target]: a loss resets WIN_STREAK by passing a large negative inc
+        ut.progress = max(0, min(ut.progress + inc, t.target))
         if ut.progress >= t.target:
             ut.completed = True
             ut.completed_at = now
@@ -433,9 +449,11 @@ async def claim_reward(session: AsyncSession, uid: int, ut_id: int) -> Optional[
 # ═══════════════════════════════════════════════════════
 
 SHOP_ITEMS = [
-    {"id": "pack_500",    "title": "💰 Пакет 500 очков",   "points": 500,  "stars": 50,  "is_vip": False},
-    {"id": "pack_1500",   "title": "💎 Пакет 1500 очков",  "points": 1500, "stars": 130, "is_vip": False},
-    {"id": "pack_5000",   "title": "👑 Пакет 5000 очков",  "points": 5000, "stars": 400, "is_vip": False},
+    {"id": "pack_100",   "title": "🪙 Пакет 100 очков",   "points": 100,  "stars": 100,  "is_vip": False},
+    {"id": "pack_500",    "title": "💰 Пакет 500 очков",   "points": 500,  "stars": 500,  "is_vip": False},
+    {"id": "pack_1000",   "title": "💎 Пакет 1000 очков",  "points": 1000, "stars": 1000, "is_vip": False},
+    {"id": "pack_1500",   "title": "🏦 Пакет 1500 очков",  "points": 1500, "stars": 1500, "is_vip": False},
+    {"id": "pack_2000",   "title": "👑 Пакет 2000 очков",  "points": 2000, "stars": 2000, "is_vip": False},
     {"id": "vip_status",  "title": "⭐ VIP-статус",         "points": 0,    "stars": 150, "is_vip": True},
 ]
 
@@ -460,3 +478,166 @@ async def process_payment(session: AsyncSession, user: User,
                   item["points"] or item["stars"],
                   f"Purchase: {item['title']}", charge_id=charge_id)
     return True
+
+
+# ═══════════════════════════════════════════════════════
+#  WITHDRAW
+# ═══════════════════════════════════════════════════════
+
+WITHDRAW_MIN      = 2000                     # обычный минимум, очки
+WITHDRAW_MIN_VIP  = 1200                     # минимум для VIP
+WITHDRAW_COOLDOWN = timedelta(hours=24)      # одна заявка в сутки
+# ДОПУЩЕНИЯ:
+#  - "в сутки" = скользящие 24 часа от последней поданной заявки (не календарные сутки).
+#    Считаются все заявки, включая отклонённые.
+#  - Очки списываются сразу при подаче, при отклонении возвращаются.
+#  - Максимума нет: можно вывести любую сумму от минимума до баланса.
+
+
+def withdraw_min(user: User) -> int:
+    return WITHDRAW_MIN_VIP if user.is_vip else WITHDRAW_MIN
+
+
+def fmt_duration(td: timedelta) -> str:
+    total = int(td.total_seconds())
+    h, rem = divmod(total, 3600)
+    m = rem // 60
+    return f"{h}ч {m}м" if h else f"{max(m, 1)}м"
+
+
+async def last_withdrawal(session: AsyncSession, uid: int) -> Optional[Withdrawal]:
+    r = await session.execute(
+        select(Withdrawal).where(Withdrawal.user_id == uid)
+        .order_by(Withdrawal.created_at.desc()).limit(1)
+    )
+    return r.scalars().first()
+
+
+async def cooldown_left(session: AsyncSession, uid: int) -> Optional[timedelta]:
+    """Сколько осталось до следующей заявки, или None если можно подавать."""
+    last = await last_withdrawal(session, uid)
+    if not last:
+        return None
+    left = last.created_at + WITHDRAW_COOLDOWN - datetime.utcnow()
+    return left if left.total_seconds() > 0 else None
+
+
+async def create_withdrawal(session: AsyncSession, uid: int, amount: int) -> Withdrawal:
+    """Бросает ValueError с текстом для юзера, если заявку подать нельзя."""
+    # блокируем строку юзера, чтобы два быстрых тапа не прошли проверку лимита оба
+    r = await session.execute(select(User).where(User.id == uid).with_for_update())
+    user = r.scalar_one()
+    if amount <= 0:
+        raise ValueError("Сумма должна быть больше 0")
+    if amount < withdraw_min(user):
+        raise ValueError(f"Минимум для вывода: {withdraw_min(user)} очков")
+    if amount > user.balance:
+        raise ValueError("Недостаточно очков")
+    left = await cooldown_left(session, uid)
+    if left:
+        raise ValueError(f"Одна заявка в сутки. Следующая будет через {fmt_duration(left)}")
+    user.balance -= amount
+    w = Withdrawal(user_id=uid, amount=amount, status="PENDING")
+    session.add(w)
+    await session.flush()
+    await _add_tx(session, uid, "WITHDRAW_REQUEST", amount, f"Withdraw request #{w.id}")
+    return w
+
+
+async def decide_withdrawal(session: AsyncSession, wid: int, approve: bool) -> Optional[Withdrawal]:
+    """None — заявка не найдена или уже обработана (двойной клик / другой админ)."""
+    r = await session.execute(select(Withdrawal).where(Withdrawal.id == wid).with_for_update())
+    w = r.scalar_one_or_none()
+    if not w or w.status != "PENDING":
+        return None
+    w.status = "APPROVED" if approve else "REJECTED"
+    w.decided_at = datetime.utcnow()
+    if not approve:
+        user = await get_user_by_id(session, w.user_id)
+        user.balance += w.amount
+        await _add_tx(session, w.user_id, "WITHDRAW_REFUND", w.amount, f"Refund withdraw #{w.id}")
+    return w
+
+
+async def get_admin_users(session: AsyncSession) -> list[User]:
+    # ДОПУЩЕНИЕ: админы определяются по ADMIN_USERNAMES и должны хотя бы раз открыть бота
+    if not ADMIN_USERNAMES:
+        return []
+    r = await session.execute(
+        select(User).where(func.lower(User.username).in_(ADMIN_USERNAMES))
+    )
+    return list(r.scalars())
+
+
+# ═══════════════════════════════════════════════════════
+#  FREE NFT
+# ═══════════════════════════════════════════════════════
+# ДОПУЩЕНИЯ:
+#  - заявка создаётся сразу при нажатии кнопки, без подтверждения;
+#  - отклонённую заявку можно подать снова; пока есть заявка на рассмотрении, новую не подать;
+#  - при повторной подаче (после отказа) админ видит третью кнопку «Отказать полностью»:
+#    она ставит статус DENIED, и юзер больше не может подавать заявки;
+#  - APPROVED: юзер пишет админу-контакту из NFT_CONTACT (по умолчанию @support).
+
+async def get_nft_claims(session: AsyncSession, uid: int) -> list[NftClaim]:
+    r = await session.execute(select(NftClaim).where(NftClaim.user_id == uid).order_by(NftClaim.id))
+    return list(r.scalars())
+
+
+def nft_state(claims: list[NftClaim]) -> str:
+    """Итоговое состояние по всем заявкам юзера: APPROVED > DENIED > PENDING > REJECTED > NONE."""
+    statuses = {c.status for c in claims}
+    for s in ("APPROVED", "DENIED", "PENDING"):
+        if s in statuses:
+            return s
+    return "REJECTED" if statuses else "NONE"
+
+
+async def create_nft_claim(session: AsyncSession, uid: int) -> NftClaim:
+    """Бросает ValueError с текстом для юзера, если подать заявку нельзя."""
+    # лочим строку юзера, чтобы два быстрых нажатия не создали две заявки
+    await session.execute(select(User).where(User.id == uid).with_for_update())
+    state = nft_state(await get_nft_claims(session, uid))
+    if state == "APPROVED":
+        raise ValueError("Заявка уже одобрена")
+    if state == "DENIED":
+        raise ValueError("NFT увы, но вы не получите")
+    if state == "PENDING":
+        raise ValueError("Заявка уже на рассмотрении")
+    c = NftClaim(user_id=uid, status="PENDING")
+    session.add(c)
+    await session.flush()
+    return c
+
+
+async def decide_nft_claim(session: AsyncSession, cid: int, action: str) -> Optional[NftClaim]:
+    """action: approve / reject / deny. None — заявка не найдена или уже обработана."""
+    r = await session.execute(select(NftClaim).where(NftClaim.id == cid).with_for_update())
+    c = r.scalar_one_or_none()
+    if not c or c.status != "PENDING":
+        return None
+    c.status = {"approve": "APPROVED", "reject": "REJECTED", "deny": "DENIED"}[action]
+    c.decided_at = datetime.utcnow()
+    return c
+
+
+# ═══════════════════════════════════════════════════════
+#  GAME SETTLE (новые игры: мины, рулетка, джокер, блэкджек, колесо)
+# ═══════════════════════════════════════════════════════
+
+def vip_mult(user: User) -> float:
+    return VIP_MULT if user.is_vip else 1.0
+
+
+def calc_payout(user: User, bet: int, base_mult: float) -> int:
+    """VIP +5% только к выигрышу. При ×1 (возврат) и проигрыше бонуса нет."""
+    if base_mult > 1.0:
+        return int(bet * base_mult * vip_mult(user))
+    return int(bet * base_mult)
+
+
+async def settle_game(session: AsyncSession, user: User, game_type: str, bet: int,
+                      result: str, base_mult: float) -> GameOut:
+    """Бросает ValueError, если баланса не хватает на ставку (ничего не меняется)."""
+    payout = calc_payout(user, bet, base_mult)
+    return await _commit_game(session, user, game_type, bet, result, payout, won=payout > bet)
